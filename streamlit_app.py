@@ -207,6 +207,8 @@ def pick_class(classes):
         for widget, param in (("sel_semester", "semester"), ("sel_course", "course"), ("sel_time", "time")):
             if param in params:
                 st.session_state[widget] = params[param]
+    if pending := st.session_state.pop("pending_select", None):
+        st.session_state.sel_semester, st.session_state.sel_course, st.session_state.sel_time = pending
 
     def choose(label_text, options, widget):
         if st.session_state.get(widget) not in options:
@@ -448,7 +450,8 @@ def class_creator(defaults=None):
             elif not TIMESLOT_RE.match(timeslot):
                 st.error("시간대는 토/0900, 수/1930 처럼 적어 주세요.")
             elif run(create_class, semester, course, timeslot):
-                st.session_state.update(sel_semester=semester, sel_course=course, sel_time=timeslot)
+                # 사이드바 선택 상자는 이미 그려졌으므로 다음 실행 때 새 반으로 바꾸기
+                st.session_state.pending_select = (semester, course, timeslot)
                 st.session_state.flash = f"{semester} · {course} · {timeslot} 반을 만들었어요."
                 st.rerun()
 
