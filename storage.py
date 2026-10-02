@@ -11,7 +11,8 @@
     "26가을|AI파이썬랩 심화|토/1100": {
       "semester": "26가을", "course": "AI파이썬랩 심화", "timeslot": "토/1100",
       "registration_open": true, "voting_open": true, "revealed": false,
-      "projects": {"학생 이름": {"title", "reason", "features", "url", "pin": {"salt", "hash"}, "updated_at"}},
+      "students": {"학생 이름": {"pin": {"salt", "hash"}, "created_at"}},
+      "projects": {"학생 이름": {"title", "reason", "features", "url", "updated_at"}},
       "votes": {"투표한 학생": {"voted_at": "...", "picks": {"부문": {"pick": "고른 학생", "reason": "고른 이유"}}}}
     }
   }
