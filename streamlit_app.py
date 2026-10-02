@@ -527,10 +527,13 @@ def login_panel(classes):
                     st.rerun()
 
 
-def student_bar(me):
-    c1, c2 = st.columns([5, 1], vertical_alignment="center")
-    c1.success(f"👤 **{me}** 이름으로 들어와 있어요. 다른 반으로 가려면 나가기를 눌러 주세요.")
-    if c2.button("나가기", key="logout", width="stretch"):
+def student_bar(cls, me):
+    """사이드바(새로고침 위)에 로그인 상태 + 나가기"""
+    st.sidebar.divider()
+    box = st.sidebar.container(border=True)
+    box.success(f"👤 **{me}** 로그인 중")
+    box.caption(f"{cls['semester']} · {cls['course']} · {cls['timeslot']}")
+    if box.button("나가기", key="logout", width="stretch", help="다른 반으로 가거나 다른 학생이 쓰려면 눌러 주세요"):
         key = st.session_state.student_login[0]
         st.session_state.last_class = tuple(key.split("|"))  # 로그인 칸에 방금 반을 다시 채우기
         st.session_state.student_login = None
@@ -925,7 +928,7 @@ def main():
         with tabs[2]:
             tab_admin(key, cls, data)
     else:
-        student_bar(me)
+        student_bar(cls, me)
         names = ["📝 프로젝트 등록", "🔍 프로젝트 보기", "🗳️ 투표하기", "🏆 결과 보기"]
         tabs = st.tabs(names, key="main_tabs")  # key: 제출 후 새로고침돼도 보던 탭 유지
         with tabs[0]:
@@ -937,7 +940,8 @@ def main():
         with tabs[3]:
             tab_results(key, cls, me, is_admin)
 
-    st.sidebar.divider()
+    if is_admin:
+        st.sidebar.divider()
     if st.sidebar.button("🔄 새로고침", width="stretch"):
         st.rerun()
 
