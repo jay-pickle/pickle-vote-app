@@ -395,7 +395,7 @@ def tab_results(cls, is_admin):
     lines = ["| 순위 | 프로젝트 | 이름 | " + " | ".join(SHORT[c] for c in CATEGORIES) + " | 합계 |",
              "|:--:|---|---|" + "--:|" * len(CATEGORIES) + "--:|"]
     for rank, name, score in ranking(total):
-        place = f"{MEDALS[rank]} {rank}위" if rank in MEDALS else f"{rank}위"
+        place = f"{MEDALS[rank]} {rank}위" if rank in MEDALS and score > 0 else f"{rank}위"
         cells = [place, md(projects[name]["title"]), md(name)]
         cells += [str(per_cat[cat][name]) for cat in CATEGORIES] + [f"**{score}**"]
         lines.append("| " + " | ".join(cells) + " |")
