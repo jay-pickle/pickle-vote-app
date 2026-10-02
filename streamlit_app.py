@@ -173,30 +173,49 @@ def label(cls, name):
 
 
 # ── 데이터 변경 함수 (store.update 에 넘김) ─────────────
-def sign_up(key, name, pin):
-    """처음 온 학생: 이름 + PIN 정하기"""
+def add_students(key, names):
+    """선생님이 반 학생 명단에 이름 추가 (PIN 은 학생이 처음 들어올 때 정함). 새로 추가된 이름 목록 반환"""
+    def change(data):
+        cls = data["classes"][key]
+        existing = {"".join(n.split()) for n in cls["students"]}
+        added = []
+        for name in names:
+            if "".join(name.split()) not in existing:
+                cls["students"][name] = {"pin": None, "created_at": now()}
+                existing.add("".join(name.split()))
+                added.append(name)
+        return added
+
+    return store.update(lambda d: change(normalize(d)), f"add students: {key} {len(names)}")
+
+
+def claim_pin(key, name, pin):
+    """명단에 있는 학생이 처음 들어올 때 PIN 정하기"""
     pin_record = hash_pin(pin)
 
     def change(data):
         cls = data["classes"].get(key)
         if cls is None:
             raise ValueError("반을 찾을 수 없어요.")
-        if name in cls["students"]:
-            raise ValueError("이미 있는 이름이에요. '들어가기'에서 PIN을 입력해 주세요. "
-                             "같은 이름의 친구가 있다면 '김피클2'처럼 구분해서 정해 주세요.")
-        cls["students"][name] = {"pin": pin_record, "created_at": now()}
+        student = cls["students"].get(name)
+        if student is None:
+            raise ValueError("이 반 명단에 없는 이름이에요. 선생님께 말씀해 주세요.")
+        if student.get("pin"):
+            raise ValueError("이미 PIN을 정한 이름이에요. '들어가기'로 들어와 주세요.")
+        student["pin"] = pin_record
+        student["pin_set_at"] = now()
         return True
 
-    return store.update(lambda d: change(normalize(d)), f"sign up: {key} {name}")
+    return store.update(lambda d: change(normalize(d)), f"claim pin: {key} {name}")
 
 
-def save_project(key, student, project):
-    """로그인한 학생의 프로젝트 등록 또는 수정. 새로 등록하면 False, 고치면 True"""
+def save_project(key, student, project, force=False):
+    """학생의 프로젝트 등록 또는 수정. 새로 등록하면 False, 고치면 True. force: 선생님은 등록이 닫혀 있어도 수정"""
     def change(data):
         cls = data["classes"].get(key)
         if cls is None:
             raise ValueError("반을 찾을 수 없어요.")
-        if not cls.get("registration_open", True):
+        if not force and not cls.get("registration_open", True):
             raise ValueError("지금은 프로젝트 등록이 닫혀 있어요.")
         if student not in cls["students"]:
             raise ValueError("학생 정보를 찾을 수 없어요. 다시 들어와 주세요.")
@@ -209,6 +228,18 @@ def save_project(key, student, project):
         return bool(old)
 
     return store.update(lambda d: change(normalize(d)), f"project: {key} {student}")
+
+
+def clear_pin(key, student):
+    """PIN 지우기: 학생이 '처음이에요'에서 새 PIN 을 직접 정함"""
+    def change(data):
+        cls = data["classes"][key]
+        if student not in cls["students"]:
+            raise ValueError("학생을 찾을 수 없어요.")
+        cls["students"][student]["pin"] = None
+        return True
+
+    return store.update(lambda d: change(normalize(d)), f"clear pin: {key} {student}")
 
 
 def set_pin(key, student, pin):
@@ -371,14 +402,18 @@ def teacher_login():
     return st.session_state.get("is_admin", False)
 
 
-# ── 학생 로그인 (이름 + PIN) ───────────────────────────
-def current_student(key, cls):
-    """이 반에 이름 + PIN 으로 들어온 학생 이름 (없으면 None)"""
-    name = st.session_state.setdefault("me", {}).get(key)
-    if name and name not in cls["students"]:  # 선생님이 학생을 지운 경우
-        st.session_state.me.pop(key, None)
-        name = None
-    return name
+# ── 학생 로그인 (반 + 이름 + PIN) ───────────────────────
+def find_student(cls, typed):
+    """띄어쓰기를 무시하고 반 명단에서 이름 찾기"""
+    want = "".join((typed or "").split())
+    for name in cls["students"]:
+        if "".join(name.split()) == want:
+            return name
+    return None
+
+
+def has_pin(cls, name):
+    return bool(cls["students"].get(name, {}).get("pin"))
 
 
 def verify_pin(key, cls, name, pin):
@@ -388,7 +423,7 @@ def verify_pin(key, cls, name, pin):
     if wait := locked_seconds(who):
         return f"PIN을 여러 번 틀렸어요. {wait // 60 + 1}분 뒤에 다시 해 보거나 선생님께 말씀해 주세요."
     if not record:
-        return "아직 PIN이 없어요. 선생님께 PIN을 정해 달라고 말씀해 주세요."
+        return "아직 PIN을 정하지 않았어요. '처음이에요'를 눌러 PIN을 정해 주세요."
     if check_pin(record, (pin or "").strip()):
         record_ok(who)
         return None
@@ -396,72 +431,115 @@ def verify_pin(key, cls, name, pin):
     return "PIN이 맞지 않아요. 잊어버렸으면 선생님께 말씀해 주세요."
 
 
-def student_panel(key, cls):
-    """반 화면 맨 위의 학생 로그인. 들어오면 모든 탭에서 그 학생으로 쓰임"""
-    me = current_student(key, cls)
-    if me:
-        c1, c2 = st.columns([5, 1], vertical_alignment="center")
-        c1.success(f"👤 **{me}** 이름으로 들어와 있어요.")
-        if c2.button("나가기", key=f"logout_{key}", width="stretch"):
-            st.session_state.me.pop(key, None)
-            st.session_state.edit_ok = {k for k in st.session_state.get("edit_ok", set()) if k[0] != key}
-            st.rerun()
-        return me
+def current_login(classes):
+    """로그인한 (반 key, 학생 이름). 반이 지워졌거나 PIN 이 초기화됐으면 로그아웃"""
+    login = st.session_state.get("student_login")
+    if not login:
+        return None
+    key, name = login
+    cls = classes.get(key)
+    if not cls or not has_pin(cls, name):
+        st.session_state.student_login = None
+        return None
+    return key, name
+
+
+def login_panel(classes):
+    """학생 첫 화면: 수업 → 시간대 → 이름 → PIN. 반별 주소로 오면 수업·시간대가 미리 채워짐"""
+    st.markdown("### 👤 로그인")
+    semesters = sorted_semesters(classes)
+    if not semesters:
+        st.info("아직 만들어진 반이 없어요. 선생님이 반을 만들면 로그인할 수 있어요.")
+        return
+    params = st.query_params
+    last = st.session_state.get("last_class")  # 방금 나간 반 (semester, course, timeslot)
+    if last and last[0] in semesters:
+        semester, defaults = last[0], {"login_course": last[1], "login_time": last[2]}
+    else:
+        semester = params.get("semester") if params.get("semester") in semesters else semesters[0]
+        defaults = {"login_course": params.get("course"), "login_time": params.get("time")}
+    for widget, value in defaults.items():  # 로그인 칸이 새로 그려질 때만 채우기 (고른 값은 유지)
+        if widget not in st.session_state and value:
+            st.session_state[widget] = value
+
+    def choose(label_text, options, widget, col):
+        if st.session_state.get(widget) not in options:
+            st.session_state[widget] = options[0]
+        return col.selectbox(label_text, options, key=widget)
 
     with st.container(border=True):
-        st.markdown("**👤 학생 로그인**")
-        st.caption("이름과 PIN으로 들어오면 프로젝트를 등록하고 투표할 수 있어요.")
-        modes = ["들어가기", "처음이에요 (이름·PIN 정하기)"]
-        mode = st.radio("로그인 방법", modes, index=0 if cls["students"] else 1, horizontal=True,
-                        label_visibility="collapsed", key=f"login_mode_{key}")
+        st.caption(f"📚 {semester} 학기 · 내 수업과 시간대를 고르고 이름과 PIN으로 들어와요.")
+        c1, c2 = st.columns(2)
+        course = choose("수업", sorted_courses(classes, semester), "login_course", c1)
+        timeslot = choose("시간대", sorted_timeslots(classes, semester, course), "login_time", c2)
+        key = class_key(semester, course, timeslot)
+        cls = classes[key]
+        if not cls["students"]:
+            st.info("선생님이 아직 이 반 학생 명단을 넣지 않았어요. 수업과 시간대가 맞는지 확인해 주세요.")
+            return
+
+        modes = ["들어가기", "처음이에요 (PIN 정하기)"]
+        mode = st.radio("로그인 방법", modes, horizontal=True, label_visibility="collapsed", key="login_mode")
         if mode == modes[0]:
-            if not cls["students"]:
-                st.info("아직 들어온 학생이 없어요. '처음이에요'를 눌러 이름과 PIN을 정해 주세요.")
-                return None
-            with st.form(f"login_{key}"):
+            with st.form("login_form"):
                 c1, c2 = st.columns(2)
-                name = c1.selectbox("내 이름", sorted(cls["students"]), index=None,
-                                    placeholder="이름을 골라 주세요", key=f"login_name_{key}")
-                pin = c2.text_input("내 PIN (숫자 4자리)", type="password", max_chars=4, key=f"login_pin_{key}")
+                name = c1.text_input("이름", max_chars=20, placeholder="예: 김피클")
+                pin = c2.text_input("PIN (숫자 4자리)", type="password", max_chars=4)
                 submitted = st.form_submit_button("들어가기", type="primary")
             if submitted:
-                if not name:
-                    st.error("이름을 골라 주세요.")
-                elif error := verify_pin(key, cls, name, pin):
+                found = find_student(cls, name)
+                if not clean(name):
+                    st.error("이름을 적어 주세요.")
+                elif not found:
+                    st.error("이 반 명단에 없는 이름이에요. 수업과 시간대가 맞는지 확인해 주세요.")
+                elif not has_pin(cls, found):
+                    st.error("아직 PIN을 정하지 않았어요. '처음이에요'를 눌러 PIN을 정해 주세요.")
+                elif error := verify_pin(key, cls, found, pin):
                     st.error(error)
                 else:
-                    st.session_state.me[key] = name
+                    st.session_state.student_login = (key, found)
                     st.rerun()
         else:
-            with st.form(f"signup_{key}"):
-                name = st.text_input("내 이름", max_chars=20, placeholder="예: 김피클", key=f"signup_name_{key}")
+            st.caption("선생님이 넣어 둔 명단에서 내 이름을 찾아 PIN을 정해요. 처음 한 번만 하면 돼요.")
+            with st.form("signup_form"):
+                name = st.text_input("이름", max_chars=20, placeholder="예: 김피클")
                 c1, c2 = st.columns(2)
-                pin = c1.text_input("PIN 정하기 (숫자 4자리)", type="password", max_chars=4, key=f"signup_pin_{key}",
+                pin = c1.text_input("PIN 정하기 (숫자 4자리)", type="password", max_chars=4,
                                     help="다음에 들어올 때 써요. 친구에게 알려 주지 마세요.")
-                pin2 = c2.text_input("PIN 한 번 더", type="password", max_chars=4, key=f"signup_pin2_{key}")
-                submitted = st.form_submit_button("시작하기", type="primary")
+                pin2 = c2.text_input("PIN 한 번 더", type="password", max_chars=4)
+                submitted = st.form_submit_button("PIN 정하고 들어가기", type="primary")
             if submitted:
-                name, pin, pin2 = clean(name), pin.strip(), pin2.strip()
-                if not name:
+                found = find_student(cls, name)
+                pin, pin2 = pin.strip(), pin2.strip()
+                if not clean(name):
                     st.error("이름을 적어 주세요.")
+                elif not found:
+                    st.error("이 반 명단에 없는 이름이에요. 수업과 시간대를 확인하고, 그래도 없으면 선생님께 말씀해 주세요.")
+                elif has_pin(cls, found):
+                    st.error("이미 PIN을 정한 이름이에요. '들어가기'로 들어와 주세요. PIN을 잊었으면 선생님께 말씀해 주세요.")
                 elif not PIN_RE.match(pin):
                     st.error("PIN은 숫자 4자리로 정해 주세요.")
                 elif pin != pin2:
                     st.error("두 PIN이 서로 달라요. 다시 입력해 주세요.")
-                elif run(sign_up, key, name, pin):
-                    st.session_state.me[key] = name
-                    st.session_state.flash = f"{name} 이름으로 들어왔어요! 정한 PIN을 꼭 기억해 두세요."
+                elif run(claim_pin, key, found, pin):
+                    st.session_state.student_login = (key, found)
+                    st.session_state.flash = f"{found} 이름으로 들어왔어요! 정한 PIN을 꼭 기억해 두세요."
                     st.rerun()
-    return None
 
 
-def need_login():
-    st.info("위의 **👤 학생 로그인**에서 이름과 PIN으로 먼저 들어와 주세요.")
+def student_bar(me):
+    c1, c2 = st.columns([5, 1], vertical_alignment="center")
+    c1.success(f"👤 **{me}** 이름으로 들어와 있어요. 다른 반으로 가려면 나가기를 눌러 주세요.")
+    if c2.button("나가기", key="logout", width="stretch"):
+        key = st.session_state.student_login[0]
+        st.session_state.last_class = tuple(key.split("|"))  # 로그인 칸에 방금 반을 다시 채우기
+        st.session_state.student_login = None
+        st.rerun()
 
 
 # ── 탭: 프로젝트 등록 ─────────────────────────────────
-def project_form(key, student, old, where="reg"):
-    """로그인한 student 의 프로젝트 등록·수정 폼. where: 그려지는 곳 (등록 탭 / 수정 창)"""
+def project_form(key, student, old, where="reg", force=False):
+    """student 의 프로젝트 등록·수정 폼. where: 그려지는 곳 (등록 탭 / 수정 창), force: 선생님 수정"""
     new = not old
     # 입력 칸 key 접두어. 수정 시각을 넣어서 다른 곳에서 고치면 새 내용으로 다시 채워지게
     k = f"{where}_{key}_{student}_{old.get('updated_at', '')}"
@@ -487,18 +565,14 @@ def project_form(key, student, old, where="reg"):
         st.error("배포한 URL을 다시 확인해 주세요.")
     else:
         project = {"title": title, "reason": reason.strip(), "features": features.strip(), "url": url}
-        updated = run(save_project, key, student, project)
+        updated = run(save_project, key, student, project, force)
         if updated is not None:
             st.session_state.flash = "프로젝트를 수정했어요!" if updated else "프로젝트를 등록했어요!"
             st.rerun()
 
 
-def tab_register(key, cls):
+def tab_register(key, cls, me):
     st.subheader("📝 내 프로젝트 등록하기")
-    me = current_student(key, cls)
-    if not me:
-        need_login()
-        return
     if not cls.get("registration_open", True):
         st.info("지금은 프로젝트 등록이 닫혀 있어요. 선생님께 말씀해 주세요.")
         return
@@ -509,66 +583,57 @@ def tab_register(key, cls):
 
 # ── 탭: 프로젝트 둘러보기 ─────────────────────────────
 @st.dialog("✏️ 프로젝트 수정", width="large")
-def edit_dialog(key, name):
-    """프로젝트 보기의 수정 버튼 → 그 학생의 PIN 을 알면 바로 수정"""
+def edit_dialog(key, name, is_admin):
+    """내 프로젝트(선생님은 모든 프로젝트) 수정 창"""
     cls = normalize(store.load())["classes"].get(key)
     if not cls or name not in cls["projects"] or name not in cls["students"]:
         st.error("프로젝트를 찾을 수 없어요. 새로고침해 주세요.")
         return
-    if not cls.get("registration_open", True):
+    if not is_admin and current_login({key: cls}) != (key, name):
+        st.error("내 프로젝트만 고칠 수 있어요.")
+        return
+    if not is_admin and not cls.get("registration_open", True):
         st.info("지금은 프로젝트 등록이 닫혀 있어서 고칠 수 없어요. 선생님께 말씀해 주세요.")
         return
-    unlocked = st.session_state.setdefault("edit_ok", set())  # 이 창에서 PIN 을 확인한 카드
-    if current_student(key, cls) != name and (key, name) not in unlocked:
-        st.write(f"**{name}** 학생의 PIN을 입력하면 「{cls['projects'][name]['title']}」을(를) 고칠 수 있어요.")
-        with st.form(f"edit_pin_{key}_{name}"):
-            pin = st.text_input("PIN (숫자 4자리)", type="password", max_chars=4)
-            submitted = st.form_submit_button("확인", type="primary")
-        if submitted:
-            if error := verify_pin(key, cls, name, pin):
-                st.error(error)
-            else:
-                unlocked.add((key, name))  # 로그인은 그대로 두고 이 카드만 수정 가능하게
-                st.rerun(scope="fragment")  # 창은 열어 둔 채 수정 칸 보여주기
-        return
-    st.caption(f"👤 {name} · 고쳐서 제출하면 새 내용으로 바뀌어요.")
-    project_form(key, name, cls["projects"][name], where="dialog")
+    st.caption(f"👤 {name} · 고쳐서 제출하면 새 내용으로 바뀌어요."
+               + (" (선생님 모드: 등록이 닫혀 있어도 고칠 수 있어요)" if is_admin else ""))
+    project_form(key, name, cls["projects"][name], where="dialog", force=is_admin)
 
 
-def tab_projects(key, cls):
+def tab_projects(key, cls, me, is_admin):
     projects = cls["projects"]
     st.subheader(f"🔍 이 반의 프로젝트 ({len(projects)}개)")
     if not projects:
         st.info("아직 등록된 프로젝트가 없어요.")
         return
+    is_open = cls.get("registration_open", True)
     cols = st.columns(2)
     for i, name in enumerate(sorted(projects)):
         p = projects[name]
         with cols[i % 2].container(border=True):
-            st.markdown(f"#### {p['title']}")
+            st.markdown(f"#### {p['title']}" + (" · 내 프로젝트" if name == me else ""))
             st.caption(f"👤 {name} · 📅 {p.get('updated_at', '')}")
             st.markdown("**만든 이유**")
             st.write(p["reason"])
             st.markdown("**기능 설명**")
             st.write(p["features"])
-            c1, c2 = st.columns([3, 1])
-            c1.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
-            if c2.button("✏️ 수정", key=f"edit_{key}_{name}", width="stretch",
-                         disabled=not cls.get("registration_open", True),
-                         help="PIN을 알면 고칠 수 있어요" if cls.get("registration_open", True) else "지금은 등록이 닫혀 있어요"):
-                edit_dialog(key, name)
+            if is_admin or name == me:  # 수정 버튼은 내 카드에만 (선생님은 모든 카드)
+                c1, c2 = st.columns([3, 1])
+                c1.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
+                if c2.button("✏️ 수정", key=f"edit_{key}_{name}", width="stretch",
+                             disabled=not (is_admin or is_open),
+                             help=None if (is_admin or is_open) else "지금은 등록이 닫혀 있어요"):
+                    edit_dialog(key, name, is_admin)
+            else:
+                st.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
 
 
 # ── 탭: 투표하기 ──────────────────────────────────────
-def tab_vote(key, cls):
+def tab_vote(key, cls, voter):
     st.subheader("🗳️ 베스트 프로젝트 투표")
     projects = cls["projects"]
     if not cls.get("voting_open", True):
         st.info("지금은 투표가 닫혀 있어요.")
-        return
-    voter = current_student(key, cls)
-    if not voter:
-        need_login()
         return
     if not [n for n in projects if n != voter]:
         st.info("투표할 친구 프로젝트가 아직 없어요.")
@@ -607,7 +672,7 @@ def tab_vote(key, cls):
 
 
 # ── 탭: 결과 보기 ─────────────────────────────────────
-def tab_results(key, cls, is_admin):
+def tab_results(key, cls, me, is_admin):
     projects = cls["projects"]
     ballots = valid_ballots(cls)
     done = [v for v, b in ballots.items() if len(b) == len(CATEGORIES)]
@@ -666,12 +731,9 @@ def tab_results(key, cls, is_admin):
 
     st.divider()
     st.markdown("### 💌 내가 받은 한마디")
-    me = current_student(key, cls)
     if is_admin:
         me = st.selectbox("학생 (선생님은 모두 볼 수 있어요)", sorted(projects), index=None,
                           placeholder="이름을 골라 주세요", key=f"notes_admin_{key}")
-    elif not me:
-        st.caption("위의 👤 학생 로그인에서 들어오면 친구들이 나에게 남긴 한마디를 볼 수 있어요.")
     elif me not in projects:
         st.caption("프로젝트를 등록하면 친구들이 남긴 한마디를 받을 수 있어요.")
         me = None
@@ -720,7 +782,30 @@ def tab_admin(key, cls, data):
         base = ""
     query = f"?semester={quote(cls['semester'])}&course={quote(cls['course'])}&time={quote(cls['timeslot'])}"
     st.code(f"{base}{query}", language=None)
-    st.caption("이 주소로 들어오면 이 반이 바로 선택돼요.")
+    st.caption("이 주소로 들어오면 로그인 칸에 이 반의 수업과 시간대가 미리 채워져요.")
+
+    st.markdown("#### 👥 학생 명단")
+    students = cls["students"]
+    if students:
+        rows = ["| 이름 | PIN | 프로젝트 | 투표 |", "|---|:--:|:--:|:--:|"]
+        for name in sorted(students):
+            rows.append(f"| {md(name)} | {'✅' if has_pin(cls, name) else '아직'} | "
+                        f"{'✅' if name in cls['projects'] else '-'} | {'✅' if name in cls['votes'] else '-'} |")
+        st.markdown("\n".join(rows))
+        st.caption(f"{len(students)}명 · PIN을 정한 학생 {sum(has_pin(cls, n) for n in students)}명. "
+                   "명단에 있는 학생만 '처음이에요'에서 PIN을 정하고 들어올 수 있어요.")
+    else:
+        st.info("아직 명단이 없어요. 아래에 이름을 넣어야 학생들이 들어올 수 있어요.")
+    with st.form(f"roster_{key}", clear_on_submit=True):
+        text = st.text_area("이름 추가 (한 줄에 한 명)", height=120, placeholder="김도원\n송제윤\n정지훈")
+        if st.form_submit_button("명단에 추가"):
+            names = list(dict.fromkeys(clean(n) for n in text.splitlines() if clean(n)))
+            if not names:
+                st.error("추가할 이름을 적어 주세요.")
+            elif (added := run(add_students, key, names)) is not None:
+                skipped = len(names) - len(added)
+                st.session_state.flash = f"{len(added)}명을 명단에 넣었어요." + (f" (이미 있는 이름 {skipped}명은 건너뜀)" if skipped else "")
+                st.rerun()
 
     st.markdown("#### 🎛️ 진행 단계")
     c1, c2, c3 = st.columns(3)
@@ -751,15 +836,22 @@ def tab_admin(key, cls, data):
                 st.session_state.flash = f"{gone} 학생을 프로젝트·투표와 함께 지웠어요."
                 st.rerun()
         st.divider()
-        who = st.selectbox("PIN 다시 정하기", sorted(cls["students"]), index=None,
-                           placeholder="PIN을 잊어버린 학생", key=f"pin_target_{key}")
-        new_pin = st.text_input("새 PIN (숫자 4자리)", max_chars=4, key=f"pin_new_{key}")
-        if st.button("PIN 바꾸기", disabled=who is None):
+        who = st.selectbox("PIN 잊어버린 학생", sorted(cls["students"]), index=None,
+                           placeholder="학생 고르기", key=f"pin_target_{key}")
+        new_pin = st.text_input("새 PIN (숫자 4자리)", max_chars=4, key=f"pin_new_{key}",
+                                help="비워 두고 'PIN 지우기'를 누르면 학생이 '처음이에요'에서 새 PIN을 직접 정해요.")
+        b1, b2 = st.columns(2)
+        if b1.button("새 PIN으로 바꾸기", disabled=who is None):
             if not PIN_RE.match(new_pin.strip()):
                 st.error("PIN은 숫자 4자리로 적어 주세요.")
             elif run(set_pin, key, who, new_pin.strip()) is not None:
                 record_ok(("student", key, who))  # 잠긴 상태도 풀어 주기
                 st.session_state.flash = f"{who} 학생의 PIN을 바꿨어요. 학생에게 알려 주세요."
+                st.rerun()
+        if b2.button("PIN 지우기", disabled=who is None):
+            if run(clear_pin, key, who) is not None:
+                record_ok(("student", key, who))
+                st.session_state.flash = f"{who} 학생의 PIN을 지웠어요. '처음이에요'에서 새 PIN을 정하게 해 주세요."
                 st.rerun()
     with c2.container(border=True):
         sure = st.checkbox("이 반의 투표를 모두 지울게요", key=f"sure_reset_{key}")
@@ -801,12 +893,18 @@ def main():
         st.balloons()
 
     classes = data["classes"]
-    key = pick_class(classes)
-    if key is None or key not in classes:
-        st.info("아직 만들어진 반이 없어요. 선생님이 반을 만들면 여기에서 고를 수 있어요.")
-        if is_admin:
+    if is_admin:  # 선생님: 사이드바에서 모든 학기의 반을 고름
+        key, me = pick_class(classes), None
+        if key is None or key not in classes:
+            st.info("아직 만들어진 반이 없어요.")
             class_creator()
-        return
+            return
+    else:  # 학생: 먼저 로그인, 로그인한 반으로 고정
+        login = current_login(classes)
+        if not login:
+            login_panel(classes)
+            return
+        key, me = login
 
     cls = classes[key]
     st.markdown(f"#### {cls['semester']} · {cls['course']} · {cls['timeslot']}")
@@ -816,23 +914,28 @@ def main():
         ("결과 공개" if cls.get("revealed") else "결과 비공개"),
     ]
     st.caption(" · ".join(steps))
-    student_panel(key, cls)
-
-    names = ["📝 프로젝트 등록", "🔍 프로젝트 보기", "🗳️ 투표하기", "🏆 결과 보기"]
     if is_admin:
-        names.append("⚙️ 관리")
-    tabs = st.tabs(names, key="main_tabs")  # key: 제출 후 새로고침돼도 보던 탭 유지
-    with tabs[0]:
-        tab_register(key, cls)
-    with tabs[1]:
-        tab_projects(key, cls)
-    with tabs[2]:
-        tab_vote(key, cls)
-    with tabs[3]:
-        tab_results(key, cls, is_admin)
-    if is_admin:
-        with tabs[4]:
+        st.caption("🔐 선생님 모드: 모든 프로젝트를 고칠 수 있고, 결과를 미리 볼 수 있어요. 학생 화면을 보려면 선생님 메뉴에서 나가기를 눌러 주세요.")
+        names = ["🔍 프로젝트 보기", "🏆 결과 보기", "⚙️ 관리"]
+        tabs = st.tabs(names, key="admin_tabs")
+        with tabs[0]:
+            tab_projects(key, cls, me, is_admin)
+        with tabs[1]:
+            tab_results(key, cls, me, is_admin)
+        with tabs[2]:
             tab_admin(key, cls, data)
+    else:
+        student_bar(me)
+        names = ["📝 프로젝트 등록", "🔍 프로젝트 보기", "🗳️ 투표하기", "🏆 결과 보기"]
+        tabs = st.tabs(names, key="main_tabs")  # key: 제출 후 새로고침돼도 보던 탭 유지
+        with tabs[0]:
+            tab_register(key, cls, me)
+        with tabs[1]:
+            tab_projects(key, cls, me, is_admin)
+        with tabs[2]:
+            tab_vote(key, cls, me)
+        with tabs[3]:
+            tab_results(key, cls, me, is_admin)
 
     st.sidebar.divider()
     if st.sidebar.button("🔄 새로고침", width="stretch"):
