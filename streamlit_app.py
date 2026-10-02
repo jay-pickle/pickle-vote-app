@@ -189,7 +189,8 @@ def delete_class(key):
 def run(action, *args):
     """저장 실행 + 오류 메시지 표시. 성공하면 결과, 실패하면 None"""
     try:
-        return action(*args) if args else action()
+        with st.spinner("저장하는 중이에요. 친구들이 한꺼번에 제출하면 몇 초 걸릴 수 있어요..."):
+            return action(*args)
     except ValueError as e:
         st.error(str(e))
     except Exception as e:  # 네트워크 오류 등
