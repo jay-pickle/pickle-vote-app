@@ -749,10 +749,10 @@ def tab_results(key, cls, me, is_admin):
             st.markdown(f"- **{cat}** · {reason}")
 
 
-# ── 탭: 선생님 관리 ───────────────────────────────────
+# ── 탭: 선생님 전용 ───────────────────────────────────
 def class_creator(defaults=None):
     defaults = defaults or {}
-    st.markdown("#### ➕ 새 반 만들기")
+    st.subheader("➕ 새 반 만들기")
     with st.form("create_class", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
         semester = c1.text_input("학기", value=defaults.get("semester", ""), placeholder="26가을",
@@ -775,10 +775,8 @@ def class_creator(defaults=None):
                 st.rerun()
 
 
-def tab_admin(key, cls, data):
-    st.subheader("⚙️ 선생님 관리")
-
-    st.markdown("#### 🔗 학생에게 보낼 주소")
+def tab_link(cls):
+    st.subheader("🔗 학생에게 보낼 주소")
     try:
         base = st.context.url.split("?")[0]
     except Exception:
@@ -787,7 +785,9 @@ def tab_admin(key, cls, data):
     st.code(f"{base}{query}", language=None)
     st.caption("이 주소로 들어오면 로그인 칸에 이 반의 수업과 시간대가 미리 채워져요.")
 
-    st.markdown("#### 👥 학생 명단")
+
+def tab_roster(key, cls):
+    st.subheader("👥 학생 명단")
     students = cls["students"]
     if students:
         rows = ["| 이름 | PIN | 프로젝트 | 투표 |", "|---|:--:|:--:|:--:|"]
@@ -810,7 +810,10 @@ def tab_admin(key, cls, data):
                 st.session_state.flash = f"{len(added)}명을 명단에 넣었어요." + (f" (이미 있는 이름 {skipped}명은 건너뜀)" if skipped else "")
                 st.rerun()
 
-    st.markdown("#### 🎛️ 진행 단계")
+
+def tab_stages(key, cls):
+    st.subheader("🎛️ 진행 단계")
+    st.caption("수업 흐름에 맞춰 켜고 꺼요. 보통 등록 → 투표 → 결과 공개 순서예요.")
     c1, c2, c3 = st.columns(3)
     for col, flag, text in ((c1, "registration_open", "프로젝트 등록 받기"),
                             (c2, "voting_open", "투표 받기"),
@@ -821,7 +824,9 @@ def tab_admin(key, cls, data):
             run(set_flag, key, flag, new)
             st.rerun()
 
-    st.markdown("#### 🧹 정리")
+
+def tab_cleanup(key, cls):
+    st.subheader("🧹 정리")
     c1, c2 = st.columns(2)
     with c1.container(border=True):
         target = st.selectbox("프로젝트 삭제", sorted(cls["projects"]), index=None,
@@ -868,11 +873,9 @@ def tab_admin(key, cls, data):
             st.session_state.flash = "반을 삭제했어요."
             st.rerun()
 
-    st.divider()
-    class_creator({"semester": cls["semester"], "course": cls["course"]})
 
-    st.divider()
-    st.markdown("#### 💾 백업")
+def tab_backup(data):
+    st.subheader("💾 백업")
     st.download_button("전체 데이터 내려받기 (JSON)",
                        json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
                        file_name=f"vote_data_{datetime.now(KST):%Y%m%d_%H%M}.json", mime="application/json")
@@ -919,14 +922,25 @@ def main():
     st.caption(" · ".join(steps))
     if is_admin:
         st.caption("🔐 선생님 모드: 모든 프로젝트를 고칠 수 있고, 결과를 미리 볼 수 있어요. 학생 화면을 보려면 선생님 메뉴에서 나가기를 눌러 주세요.")
-        names = ["🔍 프로젝트 보기", "🏆 결과 보기", "⚙️ 관리"]
-        tabs = st.tabs(names, key="admin_tabs")
+        names = ["🔍 프로젝트 보기", "🏆 결과 보기", "👥 학생 명단", "🔗 학생 주소",
+                 "🎛️ 진행 단계", "🧹 정리", "➕ 새 반", "💾 백업"]
+        tabs = st.tabs(names, key="teacher_tabs")
         with tabs[0]:
             tab_projects(key, cls, me, is_admin)
         with tabs[1]:
             tab_results(key, cls, me, is_admin)
         with tabs[2]:
-            tab_admin(key, cls, data)
+            tab_roster(key, cls)
+        with tabs[3]:
+            tab_link(cls)
+        with tabs[4]:
+            tab_stages(key, cls)
+        with tabs[5]:
+            tab_cleanup(key, cls)
+        with tabs[6]:
+            class_creator({"semester": cls["semester"], "course": cls["course"]})
+        with tabs[7]:
+            tab_backup(data)
     else:
         student_bar(cls, me)
         names = ["📝 프로젝트 등록", "🔍 프로젝트 보기", "🗳️ 투표하기", "🏆 결과 보기"]
