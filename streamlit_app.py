@@ -331,6 +331,15 @@ def delete_class(key):
     store.update(lambda d: change(normalize(d)), f"delete class: {key}")
 
 
+def wipe_all():
+    """앱 전체 데이터 삭제 (모든 학기·반·학생·프로젝트·투표)"""
+    def change(data):
+        data["classes"] = {}
+        return True
+
+    return store.update(lambda d: change(normalize(d)), "wipe all data")
+
+
 def run(action, *args):
     """저장 실행 + 오류 메시지 표시. 성공하면 결과, 실패하면 None"""
     try:
@@ -825,7 +834,7 @@ def tab_stages(key, cls):
             st.rerun()
 
 
-def tab_cleanup(key, cls):
+def tab_cleanup(key, cls, data):
     st.subheader("🧹 정리")
     c1, c2 = st.columns(2)
     with c1.container(border=True):
@@ -873,12 +882,49 @@ def tab_cleanup(key, cls):
             st.session_state.flash = "반을 삭제했어요."
             st.rerun()
 
+    st.divider()
+    wipe_section(data)
+
+
+def backup_button(data, key="backup"):
+    st.download_button("전체 데이터 내려받기 (JSON)",
+                       json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                       file_name=f"vote_data_{datetime.now(KST):%Y%m%d_%H%M}.json",
+                       mime="application/json", key=key)
+
+
+def wipe_section(data):
+    """앱 전체 데이터 삭제: 확인 문구 + 선생님 비밀번호를 모두 넣어야 실행"""
+    st.markdown("#### ⚠️ 앱 전체 데이터 삭제")
+    classes = data["classes"]
+    n_students = sum(len(c["students"]) for c in classes.values())
+    n_projects = sum(len(c["projects"]) for c in classes.values())
+    n_votes = sum(len(c["votes"]) for c in classes.values())
+    with st.container(border=True):
+        st.error(f"모든 학기의 반 {len(classes)}개, 학생 {n_students}명, 프로젝트 {n_projects}개, 투표 {n_votes}건을 "
+                 "한꺼번에 지워요. 되돌릴 수 없으니 먼저 백업을 내려받아 두세요.")
+        backup_button(data, key="backup_before_wipe")
+        with st.form("wipe_all", clear_on_submit=True):
+            phrase = st.text_input("확인 문구: **전체 삭제** 라고 입력해 주세요")
+            pw = st.text_input("선생님 비밀번호 다시 입력", type="password")
+            submitted = st.form_submit_button("앱 전체 데이터 삭제", type="primary")
+        if submitted:
+            password = admin_password()
+            if phrase.strip() != "전체 삭제":
+                st.error("확인 문구가 달라요. '전체 삭제'라고 정확히 입력해 주세요.")
+            elif not password or not hmac.compare_digest(pw.encode(), password.encode()):
+                st.error("비밀번호가 달라요.")
+            elif run(wipe_all):
+                get_attempts().clear()  # PIN 잠금 기록도 비우기
+                for k in ("sel_semester", "sel_course", "sel_time", "pending_select"):
+                    st.session_state.pop(k, None)
+                st.session_state.flash = "앱의 모든 데이터를 지웠어요."
+                st.rerun()
+
 
 def tab_backup(data):
     st.subheader("💾 백업")
-    st.download_button("전체 데이터 내려받기 (JSON)",
-                       json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-                       file_name=f"vote_data_{datetime.now(KST):%Y%m%d_%H%M}.json", mime="application/json")
+    backup_button(data)
     st.caption(f"저장 위치: {store.name}")
 
 
@@ -936,7 +982,7 @@ def main():
         with tabs[4]:
             tab_stages(key, cls)
         with tabs[5]:
-            tab_cleanup(key, cls)
+            tab_cleanup(key, cls, data)
         with tabs[6]:
             class_creator({"semester": cls["semester"], "course": cls["course"]})
         with tabs[7]:
