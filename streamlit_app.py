@@ -296,39 +296,63 @@ def create_class(semester, course, timeslot):
     return key
 
 
-def delete_project(key, student):
-    """프로젝트만 지우기 (학생과 그 학생의 투표는 남김)"""
+def delete_projects(key, names, by_student=None):
+    """프로젝트 지우기 (학생·투표 기록은 남김). by_student: 학생이 자기 프로젝트를 지울 때 그 학생 이름"""
     def change(data):
-        data["classes"][key]["projects"].pop(student, None)
-        return True
+        cls = data["classes"].get(key)
+        if cls is None:
+            raise ValueError("반을 찾을 수 없어요.")
+        if by_student is not None:  # 학생은 자기 프로젝트만, 등록이 열려 있을 때만
+            if list(names) != [by_student]:
+                raise ValueError("내 프로젝트만 지울 수 있어요.")
+            if not cls.get("registration_open", True):
+                raise ValueError("지금은 프로젝트 등록이 닫혀 있어서 지울 수 없어요. 선생님께 말씀해 주세요.")
+        removed = [n for n in names if cls["projects"].pop(n, None) is not None]
+        return removed
 
-    return store.update(lambda d: change(normalize(d)), f"delete project: {key} {student}")
+    who = by_student or "teacher"
+    return store.update(lambda d: change(normalize(d)), f"delete projects by {who}: {key} {', '.join(names)}")
 
 
-def delete_student(key, student):
+def delete_students(key, names):
     """학생과 그 학생의 프로젝트·투표를 모두 지우기"""
     def change(data):
         cls = data["classes"][key]
-        for part in ("students", "projects", "votes"):
-            cls[part].pop(student, None)
-        return True
+        removed = []
+        for name in names:
+            if cls["students"].pop(name, None) is not None:
+                removed.append(name)
+            cls["projects"].pop(name, None)
+            cls["votes"].pop(name, None)
+        return removed
 
-    return store.update(lambda d: change(normalize(d)), f"delete student: {key} {student}")
+    return store.update(lambda d: change(normalize(d)), f"delete students: {key} {', '.join(names)}")
+
+
+def delete_votes(key, voters):
+    """고른 학생들의 투표만 지우기 (다시 투표할 수 있음)"""
+    def change(data):
+        cls = data["classes"][key]
+        return [v for v in voters if cls["votes"].pop(v, None) is not None]
+
+    return store.update(lambda d: change(normalize(d)), f"delete votes: {key} {', '.join(voters)}")
 
 
 def reset_votes(key):
     def change(data):
         data["classes"][key]["votes"] = {}
         data["classes"][key]["revealed"] = False
+        return True
 
-    store.update(lambda d: change(normalize(d)), f"reset votes: {key}")
+    return store.update(lambda d: change(normalize(d)), f"reset votes: {key}")
 
 
-def delete_class(key):
+def delete_classes(keys):
+    """반 지우기 (그 반의 학생·프로젝트·투표도 함께)"""
     def change(data):
-        data["classes"].pop(key, None)
+        return [k for k in keys if data["classes"].pop(k, None) is not None]
 
-    store.update(lambda d: change(normalize(d)), f"delete class: {key}")
+    return store.update(lambda d: change(normalize(d)), f"delete classes: {', '.join(keys)}")
 
 
 def wipe_all():
@@ -591,6 +615,14 @@ def tab_register(key, cls, me):
     old = cls["projects"].get(me, {})
     st.caption("고쳐서 다시 제출하면 새 내용으로 바뀌어요." if old else "내 프로젝트 정보를 적고 등록해 주세요.")
     project_form(key, me, old)
+    if old:
+        with st.expander("🗑️ 내 프로젝트 삭제"):
+            st.caption("지우면 되돌릴 수 없어요. 친구들에게 받은 표와 한마디도 결과에서 빠져요. 지운 뒤 다시 등록할 수 있어요.")
+            sure = st.checkbox("내 프로젝트를 지울게요", key=f"sure_own_{key}_{old.get('updated_at', '')}")
+            if st.button("내 프로젝트 삭제", disabled=not sure, key=f"del_own_{key}"):
+                if run(delete_projects, key, [me], me):
+                    st.session_state.flash = "내 프로젝트를 지웠어요."
+                    st.rerun()
 
 
 # ── 탭: 프로젝트 둘러보기 ─────────────────────────────
@@ -612,6 +644,27 @@ def edit_dialog(key, name, is_admin):
     project_form(key, name, cls["projects"][name], where="dialog", force=is_admin)
 
 
+@st.dialog("🗑️ 프로젝트 삭제")
+def delete_dialog(key, name, is_admin):
+    """내 프로젝트(선생님은 모든 프로젝트) 삭제 확인 창"""
+    cls = normalize(store.load())["classes"].get(key)
+    if not cls or name not in cls["projects"]:
+        st.error("프로젝트를 찾을 수 없어요. 새로고침해 주세요.")
+        return
+    if not is_admin and current_login({key: cls}) != (key, name):
+        st.error("내 프로젝트만 지울 수 있어요.")
+        return
+    st.write(f"**{name}** 학생의 「{cls['projects'][name]['title']}」 프로젝트를 지울까요?")
+    st.warning("지우면 되돌릴 수 없어요. 이 프로젝트가 받은 표와 한마디도 결과에서 빠져요.")
+    c1, c2 = st.columns(2)
+    if c1.button("삭제할게요", type="primary", width="stretch"):
+        if run(delete_projects, key, [name], None if is_admin else name):
+            st.session_state.flash = f"{name} 학생의 프로젝트를 지웠어요." if is_admin else "내 프로젝트를 지웠어요."
+            st.rerun()
+    if c2.button("취소", width="stretch"):
+        st.rerun()
+
+
 def tab_projects(key, cls, me, is_admin):
     projects = cls["projects"]
     st.subheader(f"🔍 이 반의 프로젝트 ({len(projects)}개)")
@@ -629,13 +682,15 @@ def tab_projects(key, cls, me, is_admin):
             st.write(p["reason"])
             st.markdown("**기능 설명**")
             st.write(p["features"])
-            if is_admin or name == me:  # 수정 버튼은 내 카드에만 (선생님은 모든 카드)
-                c1, c2 = st.columns([3, 1])
+            if is_admin or name == me:  # 수정·삭제 버튼은 내 카드에만 (선생님은 모든 카드)
+                can = is_admin or is_open
+                tip = None if can else "지금은 등록이 닫혀 있어요"
+                c1, c2, c3 = st.columns([2, 1, 1])
                 c1.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
-                if c2.button("✏️ 수정", key=f"edit_{key}_{name}", width="stretch",
-                             disabled=not (is_admin or is_open),
-                             help=None if (is_admin or is_open) else "지금은 등록이 닫혀 있어요"):
+                if c2.button("✏️ 수정", key=f"edit_{key}_{name}", width="stretch", disabled=not can, help=tip):
                     edit_dialog(key, name, is_admin)
+                if c3.button("🗑️ 삭제", key=f"del_{key}_{name}", width="stretch", disabled=not can, help=tip):
+                    delete_dialog(key, name, is_admin)
             else:
                 st.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
 
@@ -820,6 +875,27 @@ def tab_roster(key, cls):
                 st.rerun()
 
 
+def pin_section(key, cls):
+    st.markdown("#### 🔑 PIN 잊어버린 학생")
+    who = st.selectbox("PIN 잊어버린 학생", sorted(cls["students"]), index=None,
+                       placeholder="학생 고르기", key=f"pin_target_{key}")
+    new_pin = st.text_input("새 PIN (숫자 4자리)", max_chars=4, key=f"pin_new_{key}",
+                            help="비워 두고 'PIN 지우기'를 누르면 학생이 '처음이에요'에서 새 PIN을 직접 정해요.")
+    b1, b2 = st.columns(2)
+    if b1.button("새 PIN으로 바꾸기", disabled=who is None):
+        if not PIN_RE.match(new_pin.strip()):
+            st.error("PIN은 숫자 4자리로 적어 주세요.")
+        elif run(set_pin, key, who, new_pin.strip()) is not None:
+            record_ok(("student", key, who))  # 잠긴 상태도 풀어 주기
+            st.session_state.flash = f"{who} 학생의 PIN을 바꿨어요. 학생에게 알려 주세요."
+            st.rerun()
+    if b2.button("PIN 지우기", disabled=who is None):
+        if run(clear_pin, key, who) is not None:
+            record_ok(("student", key, who))
+            st.session_state.flash = f"{who} 학생의 PIN을 지웠어요. '처음이에요'에서 새 PIN을 정하게 해 주세요."
+            st.rerun()
+
+
 def tab_stages(key, cls):
     st.subheader("🎛️ 진행 단계")
     st.caption("수업 흐름에 맞춰 켜고 꺼요. 보통 등록 → 투표 → 결과 공개 순서예요.")
@@ -834,53 +910,93 @@ def tab_stages(key, cls):
             st.rerun()
 
 
+def delete_box(title, help_text, options, fmt, action, args, done, wkey):
+    """여러 개 골라서 지우기: 고르기 → '지울게요' 확인 → 삭제"""
+    n = st.session_state.get("del_nonce", 0)  # 지운 뒤 고른 칸을 비우기 위한 번호
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        st.caption(help_text)
+        if not options:
+            st.caption("지울 항목이 없어요.")
+            return
+        picked = st.multiselect(title, options, format_func=fmt, placeholder="지울 항목 고르기",
+                                label_visibility="collapsed", key=f"{wkey}_pick_{n}")
+        sure = st.checkbox("고른 항목을 지울게요", key=f"{wkey}_sure_{n}")
+        if st.button(f"선택한 {len(picked)}개 삭제" if picked else "삭제", key=f"{wkey}_btn_{n}",
+                     disabled=not (picked and sure)):
+            removed = run(action, *args, picked)
+            if removed is not None:
+                st.session_state.del_nonce = n + 1
+                st.session_state.flash = done(removed)
+                st.rerun()
+
+
+def class_label(classes, k):
+    c = classes[k]
+    return (f"{c['semester']} · {c['course']} · {c['timeslot']} "
+            f"(학생 {len(c['students'])} · 프로젝트 {len(c['projects'])} · 투표 {len(c['votes'])})")
+
+
 def tab_cleanup(key, cls, data):
     st.subheader("🧹 정리")
+    st.caption("지우면 되돌릴 수 없어요. 필요하면 💾 백업 탭에서 먼저 내려받아 두세요.")
+
+    st.markdown(f"#### 이 반 ({cls['semester']} · {cls['course']} · {cls['timeslot']})")
     c1, c2 = st.columns(2)
-    with c1.container(border=True):
-        target = st.selectbox("프로젝트 삭제", sorted(cls["projects"]), index=None,
-                              format_func=lambda n: label(cls, n), placeholder="삭제할 프로젝트")
-        if st.button("선택한 프로젝트 삭제", disabled=target is None):
-            if run(delete_project, key, target):
-                st.session_state.flash = f"{target} 학생의 프로젝트를 지웠어요."
-                st.rerun()
-        st.divider()
-        gone = st.selectbox("학생 삭제", sorted(cls["students"]), index=None,
-                            placeholder="잘못 들어온 이름 등", key=f"del_student_{key}",
-                            help="그 학생의 프로젝트와 투표도 함께 지워져요.")
-        if st.button("선택한 학생 삭제", disabled=gone is None):
-            if run(delete_student, key, gone):
-                st.session_state.flash = f"{gone} 학생을 프로젝트·투표와 함께 지웠어요."
-                st.rerun()
-        st.divider()
-        who = st.selectbox("PIN 잊어버린 학생", sorted(cls["students"]), index=None,
-                           placeholder="학생 고르기", key=f"pin_target_{key}")
-        new_pin = st.text_input("새 PIN (숫자 4자리)", max_chars=4, key=f"pin_new_{key}",
-                                help="비워 두고 'PIN 지우기'를 누르면 학생이 '처음이에요'에서 새 PIN을 직접 정해요.")
-        b1, b2 = st.columns(2)
-        if b1.button("새 PIN으로 바꾸기", disabled=who is None):
-            if not PIN_RE.match(new_pin.strip()):
-                st.error("PIN은 숫자 4자리로 적어 주세요.")
-            elif run(set_pin, key, who, new_pin.strip()) is not None:
-                record_ok(("student", key, who))  # 잠긴 상태도 풀어 주기
-                st.session_state.flash = f"{who} 학생의 PIN을 바꿨어요. 학생에게 알려 주세요."
-                st.rerun()
-        if b2.button("PIN 지우기", disabled=who is None):
-            if run(clear_pin, key, who) is not None:
-                record_ok(("student", key, who))
-                st.session_state.flash = f"{who} 학생의 PIN을 지웠어요. '처음이에요'에서 새 PIN을 정하게 해 주세요."
-                st.rerun()
-    with c2.container(border=True):
-        sure = st.checkbox("이 반의 투표를 모두 지울게요", key=f"sure_reset_{key}")
-        if st.button("투표 초기화", disabled=not sure):
-            run(reset_votes, key)
-            st.session_state.flash = "투표를 초기화했어요."
-            st.rerun()
-        sure_del = st.checkbox("이 반을 프로젝트·투표와 함께 지울게요", key=f"sure_del_{key}")
-        if st.button("반 삭제", disabled=not sure_del):
-            run(delete_class, key)
-            st.session_state.flash = "반을 삭제했어요."
-            st.rerun()
+    with c1:
+        delete_box("📁 프로젝트 삭제", "프로젝트만 지워요. 학생과 투표 기록은 남아요.",
+                   sorted(cls["projects"]), lambda n: label(cls, n), delete_projects, (key,),
+                   lambda r: f"프로젝트 {len(r)}개를 지웠어요.", f"dp_{key}")
+        delete_box("🗳️ 투표 삭제", "고른 학생의 투표만 지워요. 그 학생은 다시 투표할 수 있어요.",
+                   sorted(cls["votes"]), str, delete_votes, (key,),
+                   lambda r: f"{len(r)}명의 투표를 지웠어요.", f"dv_{key}")
+    with c2:
+        delete_box("👤 학생 삭제", "명단에서 지워요. 그 학생의 프로젝트와 투표도 함께 지워져요.",
+                   sorted(cls["students"]), str, delete_students, (key,),
+                   lambda r: f"학생 {len(r)}명을 프로젝트·투표와 함께 지웠어요.", f"ds_{key}")
+        with st.container(border=True):
+            st.markdown("**🔄 투표 초기화**")
+            st.caption("이 반의 투표를 모두 지우고 결과 공개도 꺼요.")
+            sure = st.checkbox("이 반의 투표를 모두 지울게요", key=f"sure_reset_{key}")
+            if st.button("투표 초기화", disabled=not (sure and cls["votes"]), key=f"reset_{key}"):
+                if run(reset_votes, key):
+                    st.session_state.flash = "투표를 초기화했어요."
+                    st.rerun()
+
+    st.divider()
+    classes = data["classes"]
+    order = sorted(classes, key=lambda k: (-semester_sort_key(classes[k]["semester"])[0],
+                                           -semester_sort_key(classes[k]["semester"])[1],
+                                           classes[k]["course"], classes[k]["timeslot"]))
+    st.markdown("#### 🏫 반 삭제 (모든 학기)")
+    rows = ["| 학기 | 수업 | 시간대 | 학생 | 프로젝트 | 투표 |", "|---|---|---|--:|--:|--:|"]
+    for k in order:
+        c = classes[k]
+        mark = " ◀ 지금 보는 반" if k == key else ""
+        rows.append(f"| {md(c['semester'])} | {md(c['course'])} | {md(c['timeslot'])}{mark} | "
+                    f"{len(c['students'])} | {len(c['projects'])} | {len(c['votes'])} |")
+    st.markdown("\n".join(rows))
+    c1, c2 = st.columns(2)
+    with c1:
+        delete_box("반 골라서 삭제", "고른 반의 학생·프로젝트·투표가 모두 지워져요.",
+                   order, lambda k: class_label(classes, k), delete_classes, (),
+                   lambda r: f"반 {len(r)}개를 지웠어요.", "dc")
+    with c2:
+        with st.container(border=True):
+            st.markdown("**학기 통째로 삭제**")
+            st.caption("그 학기의 모든 반과 학생·프로젝트·투표가 지워져요.")
+            n = st.session_state.get("del_nonce", 0)
+            sem = st.selectbox("학기", sorted_semesters(classes), index=None, placeholder="학기 고르기",
+                               label_visibility="collapsed", key=f"dsem_pick_{n}")
+            targets = [k for k in order if classes[k]["semester"] == sem]
+            sure = st.checkbox("이 학기를 통째로 지울게요", key=f"dsem_sure_{n}")
+            if st.button(f"{sem} 반 {len(targets)}개 삭제" if sem else "삭제", key=f"dsem_btn_{n}",
+                         disabled=not (sem and sure)):
+                removed = run(delete_classes, targets)
+                if removed is not None:
+                    st.session_state.del_nonce = n + 1
+                    st.session_state.flash = f"{sem} 학기의 반 {len(removed)}개를 지웠어요."
+                    st.rerun()
 
     st.divider()
     wipe_section(data)
@@ -977,6 +1093,9 @@ def main():
             tab_results(key, cls, me, is_admin)
         with tabs[2]:
             tab_roster(key, cls)
+            if cls["students"]:
+                st.divider()
+                pin_section(key, cls)
         with tabs[3]:
             tab_link(cls)
         with tabs[4]:
