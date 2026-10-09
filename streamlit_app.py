@@ -769,18 +769,25 @@ def tab_results(key, cls, me, is_admin):
             per_cat[cat][p["pick"]] += 1
     total = {n: sum(per_cat[cat][n] for cat in CATEGORIES) for n in projects}
 
+    # 학생 화면에는 표 수를 보여주지 않고 순위만 (표를 못 받은 친구가 서운하지 않게). 선생님은 표 수까지 봄
+    show_counts = is_admin
     st.markdown("### 종합 순위")
-    st.caption("세 부문에서 받은 표를 모두 더한 순위예요.")
-    lines = ["| 순위 | 프로젝트 | 이름 | " + " | ".join(SHORT[c] for c in CATEGORIES) + " | 합계 |",
-             "|:--:|---|---|" + "--:|" * len(CATEGORIES) + "--:|"]
+    st.caption("세 부문에서 받은 표를 모두 더한 순위예요."
+               + (" 🔐 표 수는 선생님 화면에만 보여요." if show_counts else ""))
+    if show_counts:
+        lines = ["| 순위 | 프로젝트 | 이름 | " + " | ".join(SHORT[c] for c in CATEGORIES) + " | 합계 |",
+                 "|:--:|---|---|" + "--:|" * len(CATEGORIES) + "--:|"]
+    else:
+        lines = ["| 순위 | 프로젝트 | 이름 |", "|:--:|---|---|"]
     for rank, name, score in ranking(total):
         place = f"{MEDALS[rank]} {rank}위" if rank in MEDALS and score > 0 else f"{rank}위"
         cells = [place, md(projects[name]["title"]), md(name)]
-        cells += [str(per_cat[cat][name]) for cat in CATEGORIES] + [f"**{score}**"]
+        if show_counts:
+            cells += [str(per_cat[cat][name]) for cat in CATEGORIES] + [f"**{score}**"]
         lines.append("| " + " | ".join(cells) + " |")
     st.markdown("\n".join(lines))
 
-    st.markdown("### 부문별 1위")
+    st.markdown("### 부문별 순위")
     cols = st.columns(len(CATEGORIES))
     max_votes = max(len(cls["students"]) - 1, 1)  # 한 프로젝트가 받을 수 있는 최대 표 (본인 제외)
     for col, cat in zip(cols, CATEGORIES):
@@ -790,11 +797,14 @@ def tab_results(key, cls, me, is_admin):
             top = ranked[0][2] if ranked else 0
             winners = [label(cls, n) for r, n, s in ranked if r == 1 and s > 0]
             if winners:
-                st.markdown(f"🥇 **{', '.join(winners)}** · {top}표")
+                st.markdown(f"🥇 **{', '.join(winners)}**" + (f" · {top}표" if show_counts else ""))
             else:
                 st.caption("아직 표가 없어요.")
-            for rank, name, score in ranked:
-                st.progress(min(score / max_votes, 1.0), text=f"{rank}위 {label(cls, name)} · {score}표")
+            if show_counts:
+                for rank, name, score in ranked:
+                    st.progress(min(score / max_votes, 1.0), text=f"{rank}위 {label(cls, name)} · {score}표")
+            else:
+                st.markdown("  \n".join(f"{rank}위 · {md(label(cls, name))}" for rank, name, score in ranked))
 
     st.divider()
     st.markdown("### 💌 내가 받은 한마디")
