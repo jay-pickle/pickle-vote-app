@@ -5,18 +5,21 @@
 - Streamlit Cloud: secrets 에 [github] 설정이 있으면 비공개 GitHub 저장소의 JSON 파일
   (Streamlit Cloud 는 앱이 재시작되면 로컬 파일이 지워지기 때문)
 
-데이터 구조
+데이터 구조 (version 2)
 {
-  "classes": {
-    "26가을|AI파이썬랩 심화|토/1100": {
-      "semester": "26가을", "course": "AI파이썬랩 심화", "timeslot": "토/1100",
-      "registration_open": true, "voting_open": true, "revealed": false,
-      "students": {"학생 이름": {"pin": {"salt", "hash"}, "created_at"}},
-      "projects": {"학생 이름": {"title", "reason", "features", "url", "updated_at"}},
+  "version": 2,
+  "sessions": {
+    "K7Q2": {                       # 입장 코드 = 발표회 id
+      "name": "26가을 AI파이썬랩 심화 토 11:00",
+      "stage": "ready | register | vote | result",
+      "created_at": "...",
+      "students": {"학생 이름": {"added_at"}},
+      "projects": {"학생 이름": {"title", "reason", "features", "url", "created_at", "updated_at"}},
       "votes": {"투표한 학생": {"voted_at": "...", "picks": {"부문": {"pick": "고른 학생", "reason": "고른 이유"}}}}
     }
   }
 }
+예전 형식(version 1: classes + 학생 PIN)은 앱이 처음 읽을 때 자동으로 바꿔 저장합니다.
 """
 
 import base64
@@ -30,7 +33,7 @@ import requests
 
 
 def empty_data():
-    return {"version": 1, "classes": {}}
+    return {"version": 2, "sessions": {}}
 
 
 class LocalStore:

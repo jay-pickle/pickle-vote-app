@@ -1,13 +1,15 @@
-import hashlib
 import hmac
+import html
+import io
 import json
 import re
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
+import segno
 import streamlit as st
 
 from storage import make_store
@@ -21,12 +23,27 @@ CATEGORIES = {
     "완성도가 높은 서비스": "오류 없이 동작하고 화면이 보기 좋은 서비스",
 }
 SHORT = {"가장 써 보고 싶은 서비스": "써 보고 싶은", "아이디어가 돋보인 서비스": "아이디어", "완성도가 높은 서비스": "완성도"}
-SEASONS = {"봄": 1, "여름": 2, "가을": 3, "겨울": 4}
-SEMESTER_RE = re.compile(r"^(\d{2})(봄|여름|가을|겨울)$")
-TIMESLOT_RE = re.compile(r"^[월화수목금토일]/\d{4}$")
+
+# 발표회는 이 순서대로 한 단계씩 진행
+STAGES = ["ready", "register", "vote", "result"]
+STAGE_NAMES = {"ready": "준비", "register": "프로젝트 등록", "vote": "투표", "result": "결과 공개"}
+NEXT_LABEL = {"ready": "프로젝트 등록 시작", "register": "등록 마감하고 투표 시작", "vote": "투표 마감하고 결과 공개"}
+STAGE_HELP = {
+    "ready": "학생은 이름을 골라 들어온 뒤 기다려요.",
+    "register": "학생이 자기 프로젝트를 등록하고 고칠 수 있어요.",
+    "vote": "학생이 친구 프로젝트를 둘러보고 투표해요. 프로젝트는 선생님만 고칠 수 있어요.",
+    "result": "학생 화면에 순위와 내가 받은 한마디가 보여요.",
+}
+
+CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 헷갈리는 0 O 1 I L 은 뺌
+CODE_LEN = 4
+KEEP_DAYS = 90  # 만든 지 이만큼 지난 발표회는 자동으로 지움
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
-PIN_RE = re.compile(r"^\d{4}$")
 KST = ZoneInfo("Asia/Seoul")
+
+
+class NoChange(Exception):
+    """store.update 안에서 바꿀 게 없을 때 저장하지 않고 빠져나오기"""
 
 
 @st.cache_resource
@@ -61,90 +78,168 @@ def admin_password():
     return "dlab" if is_local() else None
 
 
-# ── PIN · 로그인 시도 제한 ─────────────────────────────
-def hash_pin(pin, salt=None):
-    """PIN 은 그대로 저장하지 않고 해시로 저장"""
-    salt = salt or secrets.token_hex(8)
-    digest = hashlib.pbkdf2_hmac("sha256", pin.encode(), salt.encode(), 100_000).hex()
-    return {"salt": salt, "hash": digest}
-
-
-def check_pin(record, pin):
-    if not record or not PIN_RE.match(pin or ""):
-        return False
-    return hmac.compare_digest(hash_pin(pin, record["salt"])["hash"], record["hash"])
-
-
-@st.cache_resource
-def get_attempts():
-    """틀린 횟수 기록 (모든 접속자가 공유하는 서버 메모리)"""
-    return {}
-
-
-def locked_seconds(who):
-    info = get_attempts().get(who)
-    return max(0, int(info["until"] - time.time())) if info else 0
-
-
-def record_fail(who, max_tries=5, lock_seconds=300):
-    info = get_attempts().setdefault(who, {"count": 0, "until": 0})
-    info["count"] += 1
-    if info["count"] >= max_tries:
-        info.update(count=0, until=time.time() + lock_seconds)
-
-
-def record_ok(who):
-    get_attempts().pop(who, None)
+def app_url():
+    try:
+        return st.context.url.split("?")[0]
+    except Exception:
+        return ""
 
 
 def clean(text):
     return " ".join((text or "").split())
 
 
-def class_key(semester, course, timeslot):
-    return f"{semester}|{course}|{timeslot}"
+def nospace(text):
+    return "".join((text or "").split())
 
 
-# ── 정렬 ──────────────────────────────────────────────
-def semester_sort_key(name):
-    """'26가을' → (26, 3). 형식이 다르면 맨 뒤로"""
-    m = SEMESTER_RE.match(name)
-    return (int(m.group(1)), SEASONS[m.group(2)]) if m else (-1, 0)
+def md(text):
+    """마크다운 표 안에서 깨지지 않게"""
+    return text.replace("|", "\\|").replace("*", "\\*").replace("_", "\\_")
 
 
-def sorted_semesters(classes):
-    return sorted({c["semester"] for c in classes.values()}, key=semester_sort_key, reverse=True)
+def label(s, name):
+    return f"{s['projects'][name]['title']} · {name}"
 
 
-def sorted_courses(classes, semester):
-    return sorted({c["course"] for c in classes.values() if c["semester"] == semester})
+# ── 잘못된 시도 제한 (모든 접속자가 공유하는 서버 메모리) ────
+@st.cache_resource
+def get_attempts():
+    return {}
 
 
-def sorted_timeslots(classes, semester, course):
-    return sorted(
-        {c["timeslot"] for c in classes.values() if c["semester"] == semester and c["course"] == course}
-    )
+def admin_locked():
+    info = get_attempts().get("admin")
+    return max(0, int(info["until"] - time.time())) if info else 0
+
+
+def admin_fail():
+    info = get_attempts().setdefault("admin", {"count": 0, "until": 0})
+    info["count"] += 1
+    if info["count"] >= 10:
+        info.update(count=0, until=time.time() + 60)
+
+
+def code_blocked():
+    """1분 안에 틀린 입장 코드가 20번 넘게 들어오면 잠시 막기 (코드 맞히기 방지)"""
+    fails = get_attempts().setdefault("code_fails", [])
+    cutoff = time.time() - 60
+    fails[:] = [t for t in fails if t > cutoff]
+    return len(fails) >= 20
+
+
+def code_fail():
+    get_attempts().setdefault("code_fails", []).append(time.time())
 
 
 # ── 데이터 형식 ──────────────────────────────────────
-def normalize(data):
-    """학생 명단(students)을 채워 넣기. 예전 형식(프로젝트 안의 PIN)은 학생 명단으로 옮긴다"""
-    for cls in data["classes"].values():
-        students = cls.setdefault("students", {})
-        for name, p in cls.get("projects", {}).items():
-            if "pin" in p:
-                pin = p.pop("pin")
-                students.setdefault(name, {"pin": pin, "created_at": p.get("created_at", now())})
+def new_code(existing):
+    while True:
+        code = "".join(secrets.choice(CODE_CHARS) for _ in range(CODE_LEN))
+        if code not in existing:
+            return code
+
+
+def timeslot_text(ts):
+    """'토/1100' → '토 11:00'"""
+    m = re.match(r"^(.)/(\d{2})(\d{2})$", ts or "")
+    return f"{m.group(1)} {m.group(2)}:{m.group(3)}" if m else (ts or "")
+
+
+def migrate(data):
+    """예전 형식(학기·수업·시간대 반 + 학생 PIN)을 발표회 형식으로 바꾸기. 바꾼 게 있으면 True"""
+    changed = False
+    if "sessions" not in data:
+        data["sessions"] = {}
+        changed = True
+    old = data.pop("classes", None)
+    if old:
+        changed = True
+        for c in sorted(old.values(), key=lambda c: c.get("created_at", "")):
+            students = {name: {"added_at": s.get("created_at", now())} for name, s in c.get("students", {}).items()}
+            projects = {}
+            for name, p in c.get("projects", {}).items():
+                students.setdefault(name, {"added_at": p.get("created_at", now())})
+                projects[name] = {k: v for k, v in p.items() if k != "pin"}  # PIN 은 더 이상 쓰지 않음
+            if c.get("revealed"):
+                stage = "result"
+            elif c.get("registration_open", True):
+                stage = "register"
+            elif c.get("voting_open", True):
+                stage = "vote"
+            else:
+                stage = "ready"
+            code = new_code(data["sessions"])
+            data["sessions"][code] = {
+                "name": clean(f"{c.get('semester', '')} {c.get('course', '')} {timeslot_text(c.get('timeslot'))}"),
+                "stage": stage,
+                "created_at": c.get("created_at", now()),
+                "students": students,
+                "projects": projects,
+                "votes": c.get("votes", {}),
+            }
+    if data.get("version") != 2:
+        data["version"] = 2
+        changed = True
+    return changed
+
+
+def load_data():
+    data = store.load()
+    if "classes" in data or data.get("version") != 2:
+        def change(d):
+            if not migrate(d):
+                raise NoChange
+
+        try:
+            store.update(change, "migrate: 반 → 발표회 (입장 코드)")
+        except NoChange:
+            pass
+        data = store.load()
     return data
 
 
+def expire_date(s):
+    try:
+        made = datetime.strptime(s.get("created_at", ""), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return made + timedelta(days=KEEP_DAYS)
+
+
+def purge_old(sessions):
+    """만든 지 KEEP_DAYS 일이 지난 발표회 지우기 (선생님이 들어올 때, 한 시간에 한 번만 확인)"""
+    marks = get_attempts()
+    if time.time() - marks.get("purged_at", 0) < 3600:
+        return
+    marks["purged_at"] = time.time()
+    today = datetime.now(KST).replace(tzinfo=None)
+    if not any((d := expire_date(s)) and d < today for s in sessions.values()):
+        return
+
+    def change(data):
+        old = [c for c, s in data["sessions"].items() if (d := expire_date(s)) and d < today]
+        if not old:
+            raise NoChange
+        for c in old:
+            del data["sessions"][c]
+        return old
+
+    try:
+        removed = store.update(change, "auto delete old sessions")
+        st.session_state.flash = f"만든 지 {KEEP_DAYS}일이 지난 발표회 {len(removed)}개를 자동으로 지웠어요."
+        st.rerun()
+    except NoChange:
+        pass
+
+
 # ── 집계 ──────────────────────────────────────────────
-def valid_ballots(cls):
+def valid_ballots(s):
     """명단에 있는 학생이 낸 투표만, 등록된 프로젝트를 고른 것만"""
-    projects = cls["projects"]
+    projects = s["projects"]
     ballots = {}
-    for voter, vote in cls["votes"].items():
-        if voter not in cls["students"]:
+    for voter, vote in s["votes"].items():
+        if voter not in s["students"]:
             continue
         ballots[voter] = {
             cat: pick for cat, pick in vote.get("picks", {}).items()
@@ -156,212 +251,129 @@ def valid_ballots(cls):
 def ranking(scores):
     """{이름: 점수} → [(순위, 이름, 점수)] 공동 순위 처리 (1, 1, 3 ...)"""
     items = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    result = []
-    for name, score in items:
-        rank = 1 + sum(1 for s in scores.values() if s > score)
-        result.append((rank, name, score))
-    return result
-
-
-def md(text):
-    """마크다운 표 안에서 깨지지 않게"""
-    return text.replace("|", "\\|").replace("*", "\\*").replace("_", "\\_")
-
-
-def label(cls, name):
-    return f"{cls['projects'][name]['title']} · {name}"
+    return [(1 + sum(1 for v in scores.values() if v > score), name, score) for name, score in items]
 
 
 # ── 데이터 변경 함수 (store.update 에 넘김) ─────────────
-def add_students(key, names):
-    """선생님이 반 학생 명단에 이름 추가 (PIN 은 학생이 처음 들어올 때 정함). 새로 추가된 이름 목록 반환"""
+def get_session(data, code):
+    s = data["sessions"].get(code)
+    if s is None:
+        raise ValueError("발표회를 찾을 수 없어요. 새로고침해 주세요.")
+    return s
+
+
+def parse_names(text):
+    """한 줄에 한 명. 띄어쓰기만 다른 이름은 하나로"""
+    names, seen = [], set()
+    for line in (text or "").splitlines():
+        name = clean(line)
+        if name and nospace(name) not in seen:
+            seen.add(nospace(name))
+            names.append(name)
+    return names
+
+
+def create_session(name, names):
     def change(data):
-        cls = data["classes"][key]
-        existing = {"".join(n.split()) for n in cls["students"]}
+        code = new_code(data["sessions"])
+        data["sessions"][code] = {
+            "name": name, "stage": "ready", "created_at": now(),
+            "students": {n: {"added_at": now()} for n in names},
+            "projects": {}, "votes": {},
+        }
+        return code
+
+    return store.update(change, f"create session: {name}")
+
+
+def add_students(code, names):
+    def change(data):
+        s = get_session(data, code)
+        existing = {nospace(n) for n in s["students"]}
         added = []
         for name in names:
-            if "".join(name.split()) not in existing:
-                cls["students"][name] = {"pin": None, "created_at": now()}
-                existing.add("".join(name.split()))
+            if nospace(name) not in existing:
+                s["students"][name] = {"added_at": now()}
+                existing.add(nospace(name))
                 added.append(name)
         return added
 
-    return store.update(lambda d: change(normalize(d)), f"add students: {key} {len(names)}")
+    return store.update(change, f"add students: {code} {len(names)}")
 
 
-def claim_pin(key, name, pin):
-    """명단에 있는 학생이 처음 들어올 때 PIN 정하기"""
-    pin_record = hash_pin(pin)
-
-    def change(data):
-        cls = data["classes"].get(key)
-        if cls is None:
-            raise ValueError("반을 찾을 수 없어요.")
-        student = cls["students"].get(name)
-        if student is None:
-            raise ValueError("이 반 명단에 없는 이름이에요. 선생님께 말씀해 주세요.")
-        if student.get("pin"):
-            raise ValueError("이미 PIN을 정한 이름이에요. '들어가기'로 들어와 주세요.")
-        student["pin"] = pin_record
-        student["pin_set_at"] = now()
-        return True
-
-    return store.update(lambda d: change(normalize(d)), f"claim pin: {key} {name}")
-
-
-def save_project(key, student, project, force=False):
-    """학생의 프로젝트 등록 또는 수정. 새로 등록하면 False, 고치면 True. force: 선생님은 등록이 닫혀 있어도 수정"""
-    def change(data):
-        cls = data["classes"].get(key)
-        if cls is None:
-            raise ValueError("반을 찾을 수 없어요.")
-        if not force and not cls.get("registration_open", True):
-            raise ValueError("지금은 프로젝트 등록이 닫혀 있어요.")
-        if student not in cls["students"]:
-            raise ValueError("학생 정보를 찾을 수 없어요. 다시 들어와 주세요.")
-        old = cls["projects"].get(student)
-        cls["projects"][student] = {
-            **project,
-            "created_at": (old or {}).get("created_at", now()),
-            "updated_at": now(),
-        }
-        return bool(old)
-
-    return store.update(lambda d: change(normalize(d)), f"project: {key} {student}")
-
-
-def clear_pin(key, student):
-    """PIN 지우기: 학생이 '처음이에요'에서 새 PIN 을 직접 정함"""
-    def change(data):
-        cls = data["classes"][key]
-        if student not in cls["students"]:
-            raise ValueError("학생을 찾을 수 없어요.")
-        cls["students"][student]["pin"] = None
-        return True
-
-    return store.update(lambda d: change(normalize(d)), f"clear pin: {key} {student}")
-
-
-def set_pin(key, student, pin):
-    pin_record = hash_pin(pin)
-
-    def change(data):
-        cls = data["classes"][key]
-        if student not in cls["students"]:
-            raise ValueError("학생을 찾을 수 없어요.")
-        cls["students"][student]["pin"] = pin_record
-        return True
-
-    return store.update(lambda d: change(normalize(d)), f"reset pin: {key} {student}")
-
-
-def save_vote(key, voter, picks):
-    def change(data):
-        cls = data["classes"].get(key)
-        if cls is None:
-            raise ValueError("반을 찾을 수 없어요.")
-        if not cls.get("voting_open", True):
-            raise ValueError("지금은 투표가 닫혀 있어요.")
-        if voter not in cls["students"]:
-            raise ValueError("학생 정보를 찾을 수 없어요. 다시 들어와 주세요.")
-        for p in picks.values():
-            if p["pick"] not in cls["projects"] or p["pick"] == voter:
-                raise ValueError("고른 프로젝트를 다시 확인해 주세요.")
-        cls["votes"][voter] = {"picks": picks, "voted_at": now()}
-        return True
-
-    return store.update(lambda d: change(normalize(d)), f"vote: {key} {voter}")
-
-
-def set_flag(key, flag, value):
-    def change(data):
-        data["classes"][key][flag] = value
-
-    store.update(lambda d: change(normalize(d)), f"{flag}={value}: {key}")
-
-
-def create_class(semester, course, timeslot):
-    key = class_key(semester, course, timeslot)
-
-    def change(data):
-        if key in data["classes"]:
-            raise ValueError("이미 있는 반이에요.")
-        data["classes"][key] = {
-            "semester": semester, "course": course, "timeslot": timeslot,
-            "registration_open": True, "voting_open": True, "revealed": False,
-            "created_at": now(), "students": {}, "projects": {}, "votes": {},
-        }
-
-    store.update(lambda d: change(normalize(d)), f"create class: {key}")
-    return key
-
-
-def delete_projects(key, names, by_student=None):
-    """프로젝트 지우기 (학생·투표 기록은 남김). by_student: 학생이 자기 프로젝트를 지울 때 그 학생 이름"""
-    def change(data):
-        cls = data["classes"].get(key)
-        if cls is None:
-            raise ValueError("반을 찾을 수 없어요.")
-        if by_student is not None:  # 학생은 자기 프로젝트만, 등록이 열려 있을 때만
-            if list(names) != [by_student]:
-                raise ValueError("내 프로젝트만 지울 수 있어요.")
-            if not cls.get("registration_open", True):
-                raise ValueError("지금은 프로젝트 등록이 닫혀 있어서 지울 수 없어요. 선생님께 말씀해 주세요.")
-        removed = [n for n in names if cls["projects"].pop(n, None) is not None]
-        return removed
-
-    who = by_student or "teacher"
-    return store.update(lambda d: change(normalize(d)), f"delete projects by {who}: {key} {', '.join(names)}")
-
-
-def delete_students(key, names):
+def delete_students(code, names):
     """학생과 그 학생의 프로젝트·투표를 모두 지우기"""
     def change(data):
-        cls = data["classes"][key]
+        s = get_session(data, code)
         removed = []
         for name in names:
-            if cls["students"].pop(name, None) is not None:
+            if s["students"].pop(name, None) is not None:
                 removed.append(name)
-            cls["projects"].pop(name, None)
-            cls["votes"].pop(name, None)
+            s["projects"].pop(name, None)
+            s["votes"].pop(name, None)
         return removed
 
-    return store.update(lambda d: change(normalize(d)), f"delete students: {key} {', '.join(names)}")
+    return store.update(change, f"delete students: {code} {', '.join(names)}")
 
 
-def delete_votes(key, voters):
-    """고른 학생들의 투표만 지우기 (다시 투표할 수 있음)"""
+def set_stage(code, stage):
     def change(data):
-        cls = data["classes"][key]
-        return [v for v in voters if cls["votes"].pop(v, None) is not None]
+        get_session(data, code)["stage"] = stage
+        return stage
 
-    return store.update(lambda d: change(normalize(d)), f"delete votes: {key} {', '.join(voters)}")
+    return store.update(change, f"stage={stage}: {code}")
 
 
-def reset_votes(key):
+def save_project(code, student, project, force=False):
+    """새로 등록하면 False, 고치면 True. force: 선생님은 단계와 상관없이 수정"""
     def change(data):
-        data["classes"][key]["votes"] = {}
-        data["classes"][key]["revealed"] = False
+        s = get_session(data, code)
+        if not force and s.get("stage") != "register":
+            raise ValueError("지금은 프로젝트 등록 시간이 아니에요.")
+        if student not in s["students"]:
+            raise ValueError("명단에서 이름을 찾을 수 없어요. 다시 들어와 주세요.")
+        old = s["projects"].get(student)
+        s["projects"][student] = {**project, "created_at": (old or {}).get("created_at", now()), "updated_at": now()}
+        return bool(old)
+
+    return store.update(change, f"project: {code} {student}")
+
+
+def delete_project(code, name, by_student=None):
+    """프로젝트만 지우기. by_student: 학생이 자기 프로젝트를 지울 때 (등록 시간에만)"""
+    def change(data):
+        s = get_session(data, code)
+        if by_student is not None:
+            if name != by_student:
+                raise ValueError("내 프로젝트만 지울 수 있어요.")
+            if s.get("stage") != "register":
+                raise ValueError("지금은 프로젝트를 지울 수 없어요. 선생님께 말씀해 주세요.")
+        return s["projects"].pop(name, None) is not None
+
+    return store.update(change, f"delete project by {by_student or 'teacher'}: {code} {name}")
+
+
+def save_vote(code, voter, picks):
+    def change(data):
+        s = get_session(data, code)
+        if s.get("stage") != "vote":
+            raise ValueError("지금은 투표 시간이 아니에요.")
+        if voter not in s["students"]:
+            raise ValueError("명단에서 이름을 찾을 수 없어요. 다시 들어와 주세요.")
+        for p in picks.values():
+            if p["pick"] not in s["projects"] or p["pick"] == voter:
+                raise ValueError("고른 프로젝트를 다시 확인해 주세요.")
+        s["votes"][voter] = {"picks": picks, "voted_at": now()}
         return True
 
-    return store.update(lambda d: change(normalize(d)), f"reset votes: {key}")
+    return store.update(change, f"vote: {code} {voter}")
 
 
-def delete_classes(keys):
-    """반 지우기 (그 반의 학생·프로젝트·투표도 함께)"""
+def delete_session(code):
     def change(data):
-        return [k for k in keys if data["classes"].pop(k, None) is not None]
+        return data["sessions"].pop(code, None) is not None
 
-    return store.update(lambda d: change(normalize(d)), f"delete classes: {', '.join(keys)}")
-
-
-def wipe_all():
-    """앱 전체 데이터 삭제 (모든 학기·반·학생·프로젝트·투표)"""
-    def change(data):
-        data["classes"] = {}
-        return True
-
-    return store.update(lambda d: change(normalize(d)), "wipe all data")
+    return store.update(change, f"delete session: {code}")
 
 
 def run(action, *args):
@@ -376,209 +388,38 @@ def run(action, *args):
     return None
 
 
-# ── 반 고르기 (사이드바) ─────────────────────────────────
-def pick_class(classes):
-    """사이드바에서 학기 → 수업 → 시간대를 골라 반 key 반환. 주소의 ?semester=&course=&time= 도 반영"""
-    params = st.query_params
-    if "picked_from_url" not in st.session_state:
-        st.session_state.picked_from_url = True
-        for widget, param in (("sel_semester", "semester"), ("sel_course", "course"), ("sel_time", "time")):
-            if param in params:
-                st.session_state[widget] = params[param]
-    if pending := st.session_state.pop("pending_select", None):
-        st.session_state.sel_semester, st.session_state.sel_course, st.session_state.sel_time = pending
-
-    def choose(label_text, options, widget):
-        if st.session_state.get(widget) not in options:
-            st.session_state[widget] = options[0]
-        return st.sidebar.selectbox(label_text, options, key=widget)
-
-    st.sidebar.header("📚 반 선택")
-    semesters = sorted_semesters(classes)
-    if not semesters:
-        return None
-    semester = choose("학기", semesters, "sel_semester")
-    course = choose("수업", sorted_courses(classes, semester), "sel_course")
-    timeslot = choose("시간대", sorted_timeslots(classes, semester, course), "sel_time")
-
-    wanted = {"semester": semester, "course": course, "time": timeslot}
-    if {k: params.get(k) for k in wanted} != wanted:
-        st.query_params.update(wanted)
-    return class_key(semester, course, timeslot)
-
-
-def teacher_login():
-    with st.sidebar.expander("🔐 선생님 메뉴", expanded=False):
-        password = admin_password()
-        if password is None:
-            st.warning("ADMIN_PASSWORD 가 설정되지 않아 선생님 메뉴를 쓸 수 없어요. Streamlit secrets 를 확인해 주세요.")
-            st.session_state.is_admin = False
-        elif st.session_state.get("is_admin"):
-            st.success("선생님 모드")
-            if st.button("나가기", width="stretch"):
-                st.session_state.is_admin = False
-                st.rerun()
+# ── 공통 화면 조각 ─────────────────────────────────────
+def stage_steps(stage):
+    """준비 → 등록 → 투표 → 결과 공개 (지금 단계 강조)"""
+    now_i = STAGES.index(stage)
+    chips = []
+    for i, key in enumerate(STAGES):
+        if i == now_i:
+            style = "background:#ef5a50;color:#fff;font-weight:700"
+        elif i < now_i:
+            style = "background:#fde3e1;color:#b8423b"
         else:
-            with st.form("login", border=False):
-                pw = st.text_input("비밀번호", type="password")
-                if st.form_submit_button("들어가기", width="stretch"):
-                    who = ("admin",)
-                    if wait := locked_seconds(who):
-                        st.error(f"비밀번호를 여러 번 틀렸어요. {wait}초 뒤에 다시 해 보세요.")
-                    elif hmac.compare_digest(pw.encode(), password.encode()):
-                        record_ok(who)
-                        st.session_state.is_admin = True
-                        st.rerun()
-                    else:
-                        record_fail(who, max_tries=10, lock_seconds=60)
-                        st.error("비밀번호가 달라요.")
-    return st.session_state.get("is_admin", False)
+            style = "background:#f1f2f5;color:#9aa0a6"
+        chips.append(f"<span style='{style};padding:4px 12px;border-radius:14px;font-size:0.95rem'>"
+                     f"{i + 1}. {STAGE_NAMES[key]}</span>")
+    st.markdown("<div style='display:flex;gap:6px;align-items:center;flex-wrap:wrap'>"
+                + "<span style='color:#c0c4cc'>›</span>".join(chips) + "</div>", unsafe_allow_html=True)
 
 
-# ── 학생 로그인 (반 + 이름 + PIN) ───────────────────────
-def find_student(cls, typed):
-    """띄어쓰기를 무시하고 반 명단에서 이름 찾기"""
-    want = "".join((typed or "").split())
-    for name in cls["students"]:
-        if "".join(name.split()) == want:
-            return name
-    return None
+def qr_png(url, scale=6):
+    buf = io.BytesIO()
+    segno.make(url, error="m").save(buf, kind="png", scale=scale, border=2)
+    return buf.getvalue()
 
 
-def has_pin(cls, name):
-    return bool(cls["students"].get(name, {}).get("pin"))
+def entry_url(code):
+    return f"{app_url().rstrip('/')}/?code={quote(code)}"
 
 
-def verify_pin(key, cls, name, pin):
-    """PIN 이 맞으면 None, 아니면 보여줄 오류 메시지 (틀린 횟수·잠금 포함)"""
-    who = ("student", key, name)
-    record = cls["students"].get(name, {}).get("pin")
-    if wait := locked_seconds(who):
-        return f"PIN을 여러 번 틀렸어요. {wait // 60 + 1}분 뒤에 다시 해 보거나 선생님께 말씀해 주세요."
-    if not record:
-        return "아직 PIN을 정하지 않았어요. '처음이에요'를 눌러 PIN을 정해 주세요."
-    if check_pin(record, (pin or "").strip()):
-        record_ok(who)
-        return None
-    record_fail(who)
-    return "PIN이 맞지 않아요. 잊어버렸으면 선생님께 말씀해 주세요."
-
-
-def current_login(classes):
-    """로그인한 (반 key, 학생 이름). 반이 지워졌거나 PIN 이 초기화됐으면 로그아웃"""
-    login = st.session_state.get("student_login")
-    if not login:
-        return None
-    key, name = login
-    cls = classes.get(key)
-    if not cls or not has_pin(cls, name):
-        st.session_state.student_login = None
-        return None
-    return key, name
-
-
-def login_panel(classes):
-    """학생 첫 화면: 수업 → 시간대 → 이름 → PIN. 반별 주소로 오면 수업·시간대가 미리 채워짐"""
-    st.markdown("### 👤 로그인")
-    semesters = sorted_semesters(classes)
-    if not semesters:
-        st.info("아직 만들어진 반이 없어요. 선생님이 반을 만들면 로그인할 수 있어요.")
-        return
-    params = st.query_params
-    last = st.session_state.get("last_class")  # 방금 나간 반 (semester, course, timeslot)
-    if last and last[0] in semesters:
-        semester, defaults = last[0], {"login_course": last[1], "login_time": last[2]}
-    else:
-        semester = params.get("semester") if params.get("semester") in semesters else semesters[0]
-        defaults = {"login_course": params.get("course"), "login_time": params.get("time")}
-    for widget, value in defaults.items():  # 로그인 칸이 새로 그려질 때만 채우기 (고른 값은 유지)
-        if widget not in st.session_state and value:
-            st.session_state[widget] = value
-
-    def choose(label_text, options, widget, col):
-        if st.session_state.get(widget) not in options:
-            st.session_state[widget] = options[0]
-        return col.selectbox(label_text, options, key=widget)
-
-    with st.container(border=True):
-        st.caption(f"📚 {semester} 학기 · 내 수업과 시간대를 고르고 이름과 PIN으로 들어와요.")
-        c1, c2 = st.columns(2)
-        course = choose("수업", sorted_courses(classes, semester), "login_course", c1)
-        timeslot = choose("시간대", sorted_timeslots(classes, semester, course), "login_time", c2)
-        key = class_key(semester, course, timeslot)
-        cls = classes[key]
-        if not cls["students"]:
-            st.info("선생님이 아직 이 반 학생 명단을 넣지 않았어요. 수업과 시간대가 맞는지 확인해 주세요.")
-            return
-
-        modes = ["들어가기", "처음이에요 (PIN 정하기)"]
-        mode = st.radio("로그인 방법", modes, horizontal=True, label_visibility="collapsed", key="login_mode")
-        if mode == modes[0]:
-            with st.form("login_form"):
-                c1, c2 = st.columns(2)
-                name = c1.text_input("이름", max_chars=20, placeholder="예: 김피클")
-                pin = c2.text_input("PIN (숫자 4자리)", type="password", max_chars=4)
-                submitted = st.form_submit_button("들어가기", type="primary")
-            if submitted:
-                found = find_student(cls, name)
-                if not clean(name):
-                    st.error("이름을 적어 주세요.")
-                elif not found:
-                    st.error("이 반 명단에 없는 이름이에요. 수업과 시간대가 맞는지 확인해 주세요.")
-                elif not has_pin(cls, found):
-                    st.error("아직 PIN을 정하지 않았어요. '처음이에요'를 눌러 PIN을 정해 주세요.")
-                elif error := verify_pin(key, cls, found, pin):
-                    st.error(error)
-                else:
-                    st.session_state.student_login = (key, found)
-                    st.rerun()
-        else:
-            st.caption("선생님이 넣어 둔 명단에서 내 이름을 찾아 PIN을 정해요. 처음 한 번만 하면 돼요.")
-            with st.form("signup_form"):
-                name = st.text_input("이름", max_chars=20, placeholder="예: 김피클")
-                c1, c2 = st.columns(2)
-                pin = c1.text_input("PIN 정하기 (숫자 4자리)", type="password", max_chars=4,
-                                    help="다음에 들어올 때 써요. 친구에게 알려 주지 마세요.")
-                pin2 = c2.text_input("PIN 한 번 더", type="password", max_chars=4)
-                submitted = st.form_submit_button("PIN 정하고 들어가기", type="primary")
-            if submitted:
-                found = find_student(cls, name)
-                pin, pin2 = pin.strip(), pin2.strip()
-                if not clean(name):
-                    st.error("이름을 적어 주세요.")
-                elif not found:
-                    st.error("이 반 명단에 없는 이름이에요. 수업과 시간대를 확인하고, 그래도 없으면 선생님께 말씀해 주세요.")
-                elif has_pin(cls, found):
-                    st.error("이미 PIN을 정한 이름이에요. '들어가기'로 들어와 주세요. PIN을 잊었으면 선생님께 말씀해 주세요.")
-                elif not PIN_RE.match(pin):
-                    st.error("PIN은 숫자 4자리로 정해 주세요.")
-                elif pin != pin2:
-                    st.error("두 PIN이 서로 달라요. 다시 입력해 주세요.")
-                elif run(claim_pin, key, found, pin):
-                    st.session_state.student_login = (key, found)
-                    st.session_state.flash = f"{found} 이름으로 들어왔어요! 정한 PIN을 꼭 기억해 두세요."
-                    st.rerun()
-
-
-def student_bar(cls, me):
-    """사이드바(새로고침 위)에 로그인 상태 + 나가기"""
-    st.sidebar.divider()
-    box = st.sidebar.container(border=True)
-    box.success(f"👤 **{me}** 로그인 중")
-    box.caption(f"{cls['semester']} · {cls['course']} · {cls['timeslot']}")
-    if box.button("나가기", key="logout", width="stretch", help="다른 반으로 가거나 다른 학생이 쓰려면 눌러 주세요"):
-        key = st.session_state.student_login[0]
-        st.session_state.last_class = tuple(key.split("|"))  # 로그인 칸에 방금 반을 다시 채우기
-        st.session_state.student_login = None
-        st.rerun()
-
-
-# ── 탭: 프로젝트 등록 ─────────────────────────────────
-def project_form(key, student, old, where="reg", force=False):
-    """student 의 프로젝트 등록·수정 폼. where: 그려지는 곳 (등록 탭 / 수정 창), force: 선생님 수정"""
+def project_form(code, student, old, where="reg", force=False):
+    """프로젝트 등록·수정 폼. where: 그려지는 곳, force: 선생님 수정"""
     new = not old
-    # 입력 칸 key 접두어. 수정 시각을 넣어서 다른 곳에서 고치면 새 내용으로 다시 채워지게
-    k = f"{where}_{key}_{student}_{old.get('updated_at', '')}"
+    k = f"{where}_{code}_{student}_{old.get('updated_at', '')}"  # 다른 곳에서 고치면 새 내용으로 다시 채워지게
     with st.form(f"form_{k}"):
         title = st.text_input("프로젝트 이름", value=old.get("title", ""), max_chars=40, key=f"title_{k}")
         reason = st.text_area("만든 이유", value=old.get("reason", ""), height=100,
@@ -601,180 +442,87 @@ def project_form(key, student, old, where="reg", force=False):
         st.error("배포한 URL을 다시 확인해 주세요.")
     else:
         project = {"title": title, "reason": reason.strip(), "features": features.strip(), "url": url}
-        updated = run(save_project, key, student, project, force)
+        updated = run(save_project, code, student, project, force)
         if updated is not None:
             st.session_state.flash = "프로젝트를 수정했어요!" if updated else "프로젝트를 등록했어요!"
             st.rerun()
 
 
-def tab_register(key, cls, me):
-    st.subheader("📝 내 프로젝트 등록하기")
-    if not cls.get("registration_open", True):
-        st.info("지금은 프로젝트 등록이 닫혀 있어요. 선생님께 말씀해 주세요.")
-        return
-    old = cls["projects"].get(me, {})
-    st.caption("고쳐서 다시 제출하면 새 내용으로 바뀌어요." if old else "내 프로젝트 정보를 적고 등록해 주세요.")
-    project_form(key, me, old)
-    if old:
-        with st.expander("🗑️ 내 프로젝트 삭제"):
-            st.caption("지우면 되돌릴 수 없어요. 친구들에게 받은 표와 한마디도 결과에서 빠져요. 지운 뒤 다시 등록할 수 있어요.")
-            sure = st.checkbox("내 프로젝트를 지울게요", key=f"sure_own_{key}_{old.get('updated_at', '')}")
-            if st.button("내 프로젝트 삭제", disabled=not sure, key=f"del_own_{key}"):
-                if run(delete_projects, key, [me], me):
-                    st.session_state.flash = "내 프로젝트를 지웠어요."
-                    st.rerun()
-
-
-# ── 탭: 프로젝트 둘러보기 ─────────────────────────────
 @st.dialog("✏️ 프로젝트 수정", width="large")
-def edit_dialog(key, name, is_admin):
-    """내 프로젝트(선생님은 모든 프로젝트) 수정 창"""
-    cls = normalize(store.load())["classes"].get(key)
-    if not cls or name not in cls["projects"] or name not in cls["students"]:
+def edit_dialog(code, name):
+    """선생님 전용: 단계와 상관없이 수정"""
+    s = store.load()["sessions"].get(code)
+    if not s or name not in s["projects"]:
         st.error("프로젝트를 찾을 수 없어요. 새로고침해 주세요.")
         return
-    if not is_admin and current_login({key: cls}) != (key, name):
-        st.error("내 프로젝트만 고칠 수 있어요.")
-        return
-    if not is_admin and not cls.get("registration_open", True):
-        st.info("지금은 프로젝트 등록이 닫혀 있어서 고칠 수 없어요. 선생님께 말씀해 주세요.")
-        return
-    st.caption(f"👤 {name} · 고쳐서 제출하면 새 내용으로 바뀌어요."
-               + (" (선생님 모드: 등록이 닫혀 있어도 고칠 수 있어요)" if is_admin else ""))
-    project_form(key, name, cls["projects"][name], where="dialog", force=is_admin)
+    st.caption(f"👤 {name} · 고쳐서 제출하면 새 내용으로 바뀌어요.")
+    project_form(code, name, s["projects"][name], where="dialog", force=True)
 
 
 @st.dialog("🗑️ 프로젝트 삭제")
-def delete_dialog(key, name, is_admin):
-    """내 프로젝트(선생님은 모든 프로젝트) 삭제 확인 창"""
-    cls = normalize(store.load())["classes"].get(key)
-    if not cls or name not in cls["projects"]:
+def delete_dialog(code, name):
+    s = store.load()["sessions"].get(code)
+    if not s or name not in s["projects"]:
         st.error("프로젝트를 찾을 수 없어요. 새로고침해 주세요.")
         return
-    if not is_admin and current_login({key: cls}) != (key, name):
-        st.error("내 프로젝트만 지울 수 있어요.")
-        return
-    st.write(f"**{name}** 학생의 「{cls['projects'][name]['title']}」 프로젝트를 지울까요?")
+    st.write(f"**{name}** 학생의 「{s['projects'][name]['title']}」 프로젝트를 지울까요?")
     st.warning("지우면 되돌릴 수 없어요. 이 프로젝트가 받은 표와 한마디도 결과에서 빠져요.")
     c1, c2 = st.columns(2)
     if c1.button("삭제할게요", type="primary", width="stretch"):
-        if run(delete_projects, key, [name], None if is_admin else name):
-            st.session_state.flash = f"{name} 학생의 프로젝트를 지웠어요." if is_admin else "내 프로젝트를 지웠어요."
+        if run(delete_project, code, name):
+            st.session_state.flash = f"{name} 학생의 프로젝트를 지웠어요."
             st.rerun()
     if c2.button("취소", width="stretch"):
         st.rerun()
 
 
-def tab_projects(key, cls, me, is_admin):
-    projects = cls["projects"]
-    st.subheader(f"🔍 이 반의 프로젝트 ({len(projects)}개)")
-    if not projects:
-        st.info("아직 등록된 프로젝트가 없어요.")
-        return
-    is_open = cls.get("registration_open", True)
+def project_cards(code, s, names, teacher=False, me=None):
     cols = st.columns(2)
-    for i, name in enumerate(sorted(projects)):
-        p = projects[name]
+    for i, name in enumerate(names):
+        p = s["projects"][name]
         with cols[i % 2].container(border=True):
             st.markdown(f"#### {p['title']}" + (" · 내 프로젝트" if name == me else ""))
-            st.caption(f"👤 {name} · 📅 {p.get('updated_at', '')}")
-            st.markdown("**만든 이유**")
+            st.caption(f"👤 {name}")
             st.write(p["reason"])
-            st.markdown("**기능 설명**")
-            st.write(p["features"])
-            if is_admin or name == me:  # 수정·삭제 버튼은 내 카드에만 (선생님은 모든 카드)
-                can = is_admin or is_open
-                tip = None if can else "지금은 등록이 닫혀 있어요"
+            with st.expander("기능 설명"):
+                st.write(p["features"])
+            if teacher:
                 c1, c2, c3 = st.columns([2, 1, 1])
                 c1.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
-                if c2.button("✏️ 수정", key=f"edit_{key}_{name}", width="stretch", disabled=not can, help=tip):
-                    edit_dialog(key, name, is_admin)
-                if c3.button("🗑️ 삭제", key=f"del_{key}_{name}", width="stretch", disabled=not can, help=tip):
-                    delete_dialog(key, name, is_admin)
+                if c2.button("✏️ 수정", key=f"edit_{code}_{name}", width="stretch"):
+                    edit_dialog(code, name)
+                if c3.button("🗑️ 삭제", key=f"del_{code}_{name}", width="stretch"):
+                    delete_dialog(code, name)
             else:
                 st.link_button("🚀 앱 열어 보기", p["url"], width="stretch")
 
 
-# ── 탭: 투표하기 ──────────────────────────────────────
-def tab_vote(key, cls, voter):
-    st.subheader("🗳️ 베스트 프로젝트 투표")
-    projects = cls["projects"]
-    if not cls.get("voting_open", True):
-        st.info("지금은 투표가 닫혀 있어요.")
-        return
-    if not [n for n in projects if n != voter]:
-        st.info("투표할 친구 프로젝트가 아직 없어요.")
-        return
-    st.caption("부문마다 친구 프로젝트 하나씩 골라요. 내 프로젝트는 목록에 나오지 않고, 다시 제출하면 앞의 투표가 새 투표로 바뀌어요.")
-
-    prev = cls["votes"].get(voter, {}).get("picks", {})
-    if prev:
-        st.info("이미 투표했어요. 다시 제출하면 앞의 투표가 새 투표로 바뀌어요.")
-
-    friends = [n for n in sorted(projects) if n != voter]
-    picks = {}
-    with st.form(f"vote_form_{key}_{voter}"):
-        for cat, desc in CATEGORIES.items():
-            st.markdown(f"##### {cat}")
-            st.caption(desc)
-            before = prev.get(cat, {})
-            index = friends.index(before["pick"]) if before.get("pick") in friends else None
-            pick = st.radio(cat, friends, index=index, format_func=lambda n: label(cls, n),
-                            label_visibility="collapsed", key=f"pick_{key}_{voter}_{cat}")
-            reason = st.text_input("고른 이유 한 줄 (친구에게 그대로 전달돼요)", value=before.get("reason", ""),
-                                   max_chars=100, key=f"reason_{key}_{voter}_{cat}")
-            picks[cat] = {"pick": pick, "reason": clean(reason)}
-            st.divider()
-        submitted = st.form_submit_button("투표 제출", type="primary")
-
-    if submitted:
-        if any(p["pick"] is None for p in picks.values()):
-            st.error("세 부문 모두 하나씩 골라 주세요.")
-        elif any(not p["reason"] for p in picks.values()):
-            st.error("부문마다 고른 이유를 한 줄씩 적어 주세요.")
-        elif run(save_vote, key, voter, picks):
-            st.session_state.flash = "투표가 제출되었어요!"
-            st.session_state.balloons = True
-            st.rerun()
-
-
-# ── 탭: 결과 보기 ─────────────────────────────────────
-def tab_results(key, cls, me, is_admin):
-    projects = cls["projects"]
-    ballots = valid_ballots(cls)
+def results(code, s, me=None, teacher=False, private=False):
+    """투표 결과. private: 표 수와 모든 학생의 한마디까지 (선생님 전용)"""
+    projects = s["projects"]
+    ballots = valid_ballots(s)
     done = [v for v, b in ballots.items() if len(b) == len(CATEGORIES)]
+    students = s["students"]
 
-    st.subheader("🏆 투표 결과")
     c1, c2 = st.columns([1, 2])
-    students = cls["students"]
     c1.metric("투표 완료", f"{len(done)} / {len(students)}명")
     waiting = sorted(set(students) - set(done))
     if waiting:
         c2.caption("아직 투표하지 않은 친구")
         c2.write(", ".join(waiting))
-
-    if not cls.get("revealed"):
-        if not is_admin:
-            st.info("선생님이 결과를 공개하면 여기에서 볼 수 있어요.")
-            return
-        st.warning("👀 선생님 미리보기: 학생들에게는 아직 결과가 보이지 않아요.")
-
     if not projects:
+        st.info("아직 등록된 프로젝트가 없어요.")
         return
 
-    # 종합 순위: 세 부문 득표 합계
     per_cat = {cat: {n: 0 for n in projects} for cat in CATEGORIES}
     for ballot in ballots.values():
         for cat, p in ballot.items():
             per_cat[cat][p["pick"]] += 1
     total = {n: sum(per_cat[cat][n] for cat in CATEGORIES) for n in projects}
 
-    # 학생 화면에는 표 수를 보여주지 않고 순위만 (표를 못 받은 친구가 서운하지 않게). 선생님은 표 수까지 봄
-    show_counts = is_admin
     st.markdown("### 종합 순위")
-    st.caption("세 부문에서 받은 표를 모두 더한 순위예요."
-               + (" 🔐 표 수는 선생님 화면에만 보여요." if show_counts else ""))
-    if show_counts:
+    st.caption("세 부문에서 받은 표를 모두 더한 순위예요.")
+    if private:
         lines = ["| 순위 | 프로젝트 | 이름 | " + " | ".join(SHORT[c] for c in CATEGORIES) + " | 합계 |",
                  "|:--:|---|---|" + "--:|" * len(CATEGORIES) + "--:|"]
     else:
@@ -782,38 +530,40 @@ def tab_results(key, cls, me, is_admin):
     for rank, name, score in ranking(total):
         place = f"{MEDALS[rank]} {rank}위" if rank in MEDALS and score > 0 else f"{rank}위"
         cells = [place, md(projects[name]["title"]), md(name)]
-        if show_counts:
+        if private:
             cells += [str(per_cat[cat][name]) for cat in CATEGORIES] + [f"**{score}**"]
         lines.append("| " + " | ".join(cells) + " |")
     st.markdown("\n".join(lines))
 
     st.markdown("### 부문별 순위")
     cols = st.columns(len(CATEGORIES))
-    max_votes = max(len(cls["students"]) - 1, 1)  # 한 프로젝트가 받을 수 있는 최대 표 (본인 제외)
+    max_votes = max(len(students) - 1, 1)
     for col, cat in zip(cols, CATEGORIES):
         with col.container(border=True):
             st.markdown(f"**{cat}**")
             ranked = ranking(per_cat[cat])
             top = ranked[0][2] if ranked else 0
-            winners = [label(cls, n) for r, n, s in ranked if r == 1 and s > 0]
+            winners = [label(s, n) for r, n, v in ranked if r == 1 and v > 0]
             if winners:
-                st.markdown(f"🥇 **{', '.join(winners)}**" + (f" · {top}표" if show_counts else ""))
+                st.markdown(f"🥇 **{', '.join(winners)}**" + (f" · {top}표" if private else ""))
             else:
                 st.caption("아직 표가 없어요.")
-            if show_counts:
+            if private:
                 for rank, name, score in ranked:
-                    st.progress(min(score / max_votes, 1.0), text=f"{rank}위 {label(cls, name)} · {score}표")
+                    st.progress(min(score / max_votes, 1.0), text=f"{rank}위 {label(s, name)} · {score}표")
             else:
-                st.markdown("  \n".join(f"{rank}위 · {md(label(cls, name))}" for rank, name, score in ranked))
+                st.markdown("  \n".join(f"{rank}위 · {md(label(s, name))}" for rank, name, score in ranked))
 
     st.divider()
     st.markdown("### 💌 내가 받은 한마디")
-    if is_admin:
-        me = st.selectbox("학생 (선생님은 모두 볼 수 있어요)", sorted(projects), index=None,
-                          placeholder="이름을 골라 주세요", key=f"notes_admin_{key}")
+    if teacher:
+        if not private:
+            st.caption("위의 '선생님만 볼 정보 보이기'를 켜면 학생별 한마디를 볼 수 있어요.")
+            return
+        me = st.selectbox("학생", sorted(projects), index=None, placeholder="이름을 골라 주세요", key=f"notes_{code}")
     elif me not in projects:
-        st.caption("프로젝트를 등록하면 친구들이 남긴 한마디를 받을 수 있어요.")
-        me = None
+        st.caption("프로젝트를 등록한 친구만 한마디를 받을 수 있어요.")
+        return
     if me:
         notes = [(cat, p["reason"]) for b in ballots.values() for cat, p in b.items()
                  if p["pick"] == me and p.get("reason")]
@@ -823,235 +573,370 @@ def tab_results(key, cls, me, is_admin):
             st.markdown(f"- **{cat}** · {reason}")
 
 
-# ── 탭: 선생님 전용 ───────────────────────────────────
-def class_creator(defaults=None):
-    defaults = defaults or {}
-    st.subheader("➕ 새 반 만들기")
-    with st.form("create_class", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        semester = c1.text_input("학기", value=defaults.get("semester", ""), placeholder="26가을",
-                                 help="연도 두 자리 + 봄/여름/가을/겨울 (예: 26가을, 27봄)")
-        course = c2.text_input("수업", value=defaults.get("course", ""), placeholder="AI파이썬랩 심화")
-        timeslot = c3.text_input("시간대", value="", placeholder="토/1100",
-                                 help="요일/시각 네 자리 (예: 토/0900, 수/1930)")
-        if st.form_submit_button("반 만들기", type="primary"):
-            semester, course, timeslot = clean(semester).replace(" ", ""), clean(course), clean(timeslot).replace(" ", "")
-            if not SEMESTER_RE.match(semester):
-                st.error("학기는 26가을, 27봄 처럼 적어 주세요.")
-            elif not course:
-                st.error("수업 이름을 적어 주세요.")
-            elif not TIMESLOT_RE.match(timeslot):
-                st.error("시간대는 토/0900, 수/1930 처럼 적어 주세요.")
-            elif run(create_class, semester, course, timeslot):
-                # 사이드바 선택 상자는 이미 그려졌으므로 다음 실행 때 새 반으로 바꾸기
-                st.session_state.pending_select = (semester, course, timeslot)
-                st.session_state.flash = f"{semester} · {course} · {timeslot} 반을 만들었어요."
-                st.rerun()
+# ── 학생 화면 ─────────────────────────────────────────
+def entry_page(sessions):
+    """입장 코드(또는 QR 주소) → 명단에서 내 이름 고르기"""
+    st.markdown("### 👤 들어가기")
+    code = (st.query_params.get("code") or "").strip().upper()
+    if code and (code_blocked() or code not in sessions):
+        if code not in sessions:
+            code_fail()
+        st.session_state.code_error = "blocked" if code_blocked() else "notfound"
+        del st.query_params["code"]
+        st.rerun()
+
+    if code:
+        s = sessions[code]
+        with st.container(border=True):
+            st.markdown(f"#### {s['name']}")
+            if not s["students"]:
+                st.info("선생님이 아직 명단을 넣지 않았어요. 잠시 뒤 새로고침해 주세요.")
+            else:
+                with st.form("pick_name"):
+                    name = st.selectbox("내 이름", sorted(s["students"]), index=None, placeholder="이름 고르기")
+                    ok = st.form_submit_button("들어가기", type="primary")
+                st.caption("내 이름이 없으면 선생님께 말씀해 주세요.")
+                if ok:
+                    if not name:
+                        st.error("이름을 골라 주세요.")
+                    else:
+                        st.session_state.student_login = (code, name)
+                        st.rerun()
+        if st.button("다른 코드로 들어가기"):
+            del st.query_params["code"]
+            st.rerun()
+        return
+
+    if error := st.session_state.pop("code_error", None):
+        st.error("잘못된 코드가 너무 많이 들어왔어요. 1분 뒤에 다시 해 보세요." if error == "blocked"
+                 else "입장 코드를 찾을 수 없어요. 선생님 화면의 코드를 다시 확인해 주세요.")
+    with st.container(border=True):
+        st.caption("선생님 화면의 QR을 찍거나 입장 코드 4자리를 넣어 주세요.")
+        with st.form("code_form", border=False):
+            typed = st.text_input("입장 코드", max_chars=CODE_LEN, placeholder="예: K7Q2")
+            ok = st.form_submit_button("다음", type="primary")
+    if ok:
+        typed = nospace(typed).upper()
+        if code_blocked():
+            st.error("잘못된 코드가 너무 많이 들어왔어요. 1분 뒤에 다시 해 보세요.")
+        elif typed in sessions:
+            st.query_params["code"] = typed
+            st.rerun()
+        else:
+            code_fail()
+            st.error("입장 코드를 찾을 수 없어요. 선생님 화면의 코드를 다시 확인해 주세요.")
 
 
-def tab_link(cls):
-    st.subheader("🔗 학생에게 보낼 주소")
+def current_login(sessions):
+    """로그인한 (코드, 이름). 발표회가 지워졌거나 명단에서 빠졌으면 로그아웃"""
+    login = st.session_state.get("student_login")
+    if not login:
+        return None
+    code, name = login
+    s = sessions.get(code)
+    if not s or name not in s["students"]:
+        st.session_state.student_login = None
+        return None
+    return code, name
+
+
+@st.fragment(run_every="5s")
+def stage_watch(code, stage):
+    """선생님이 단계를 넘기면 학생 화면이 저절로 바뀌게"""
     try:
-        base = st.context.url.split("?")[0]
+        current = store.load()["sessions"].get(code, {}).get("stage")
     except Exception:
-        base = ""
-    query = f"?semester={quote(cls['semester'])}&course={quote(cls['course'])}&time={quote(cls['timeslot'])}"
-    st.code(f"{base}{query}", language=None)
-    st.caption("이 주소로 들어오면 로그인 칸에 이 반의 수업과 시간대가 미리 채워져요.")
+        return
+    if current != stage:
+        st.rerun()
 
 
-def tab_roster(key, cls):
-    st.subheader("👥 학생 명단")
-    students = cls["students"]
-    if students:
-        rows = ["| 이름 | PIN | 프로젝트 | 투표 |", "|---|:--:|:--:|:--:|"]
-        for name in sorted(students):
-            rows.append(f"| {md(name)} | {'✅' if has_pin(cls, name) else '아직'} | "
-                        f"{'✅' if name in cls['projects'] else '-'} | {'✅' if name in cls['votes'] else '-'} |")
-        st.markdown("\n".join(rows))
-        st.caption(f"{len(students)}명 · PIN을 정한 학생 {sum(has_pin(cls, n) for n in students)}명. "
-                   "명단에 있는 학생만 '처음이에요'에서 PIN을 정하고 들어올 수 있어요.")
+def student_view(code, s, me):
+    box = st.sidebar.container(border=True)
+    box.success(f"👤 **{me}**")
+    box.caption(s["name"])
+    if box.button("나가기", width="stretch", help="다른 학생이 이 기기를 쓰려면 눌러 주세요"):
+        st.session_state.student_login = None
+        st.rerun()
+
+    stage = s.get("stage", "ready")
+    st.markdown(f"#### {s['name']}")
+    stage_steps(stage)
+    st.write("")
+    stage_watch(code, stage)
+
+    if stage == "ready":
+        st.info("곧 시작해요! 선생님이 시작하면 이 화면이 저절로 프로젝트 등록 화면으로 바뀌어요.")
+    elif stage == "register":
+        st.subheader("📝 내 프로젝트 등록")
+        old = s["projects"].get(me, {})
+        st.caption("고쳐서 다시 제출하면 새 내용으로 바뀌어요." if old else "내 프로젝트 정보를 적고 등록해 주세요.")
+        project_form(code, me, old)
+        if old:
+            with st.expander("🗑️ 내 프로젝트 삭제"):
+                st.caption("지우면 되돌릴 수 없어요. 지운 뒤 다시 등록할 수 있어요.")
+                sure = st.checkbox("내 프로젝트를 지울게요", key=f"sure_own_{code}_{old.get('updated_at', '')}")
+                if st.button("내 프로젝트 삭제", disabled=not sure):
+                    if run(delete_project, code, me, me):
+                        st.session_state.flash = "내 프로젝트를 지웠어요."
+                        st.rerun()
+        st.caption(f"우리 반 등록 {len(s['projects'])} / {len(s['students'])}명")
+    elif stage == "vote":
+        vote_section(code, s, me)
     else:
-        st.info("아직 명단이 없어요. 아래에 이름을 넣어야 학생들이 들어올 수 있어요.")
-    with st.form(f"roster_{key}", clear_on_submit=True):
-        text = st.text_area("이름 추가 (한 줄에 한 명)", height=120, placeholder="김도원\n송제윤\n정지훈")
-        if st.form_submit_button("명단에 추가"):
-            names = list(dict.fromkeys(clean(n) for n in text.splitlines() if clean(n)))
-            if not names:
-                st.error("추가할 이름을 적어 주세요.")
-            elif (added := run(add_students, key, names)) is not None:
-                skipped = len(names) - len(added)
-                st.session_state.flash = f"{len(added)}명을 명단에 넣었어요." + (f" (이미 있는 이름 {skipped}명은 건너뜀)" if skipped else "")
+        st.subheader("🏆 투표 결과")
+        results(code, s, me=me)
+
+
+def vote_section(code, s, voter):
+    st.subheader("🗳️ 친구 프로젝트 투표")
+    friends = [n for n in sorted(s["projects"]) if n != voter]
+    if not friends:
+        st.info("투표할 친구 프로젝트가 아직 없어요.")
+        return
+    st.markdown("##### 1. 친구 프로젝트 둘러보기")
+    project_cards(code, s, friends)
+
+    st.markdown("##### 2. 부문마다 한 명씩 고르기")
+    st.caption("내 프로젝트는 목록에 나오지 않아요. 다시 제출하면 앞의 투표가 새 투표로 바뀌어요.")
+    prev = s["votes"].get(voter, {}).get("picks", {})
+    if prev:
+        st.info("이미 투표했어요. 다시 제출하면 앞의 투표가 새 투표로 바뀌어요.")
+    picks = {}
+    with st.form(f"vote_form_{code}_{voter}"):
+        for cat, desc in CATEGORIES.items():
+            st.markdown(f"**{cat}**")
+            st.caption(desc)
+            before = prev.get(cat, {})
+            index = friends.index(before["pick"]) if before.get("pick") in friends else None
+            pick = st.radio(cat, friends, index=index, format_func=lambda n: label(s, n),
+                            label_visibility="collapsed", key=f"pick_{code}_{voter}_{cat}")
+            reason = st.text_input("고른 이유 한 줄 (친구에게 그대로 전달돼요)", value=before.get("reason", ""),
+                                   max_chars=100, key=f"reason_{code}_{voter}_{cat}")
+            picks[cat] = {"pick": pick, "reason": clean(reason)}
+            st.divider()
+        submitted = st.form_submit_button("투표 제출", type="primary")
+    if submitted:
+        if any(p["pick"] is None for p in picks.values()):
+            st.error("세 부문 모두 하나씩 골라 주세요.")
+        elif any(not p["reason"] for p in picks.values()):
+            st.error("부문마다 고른 이유를 한 줄씩 적어 주세요.")
+        elif run(save_vote, code, voter, picks):
+            st.session_state.flash = "투표가 제출되었어요!"
+            st.session_state.balloons = True
+            st.rerun()
+
+
+# ── 선생님 화면 ───────────────────────────────────────
+def teacher_login():
+    with st.sidebar.expander("🔐 선생님 메뉴", expanded=False):
+        password = admin_password()
+        if password is None:
+            st.warning("ADMIN_PASSWORD 가 설정되지 않아 선생님 메뉴를 쓸 수 없어요. Streamlit secrets 를 확인해 주세요.")
+            st.session_state.is_admin = False
+        elif st.session_state.get("is_admin"):
+            st.success("선생님 모드")
+            if st.button("나가기 (학생 화면 보기)", width="stretch"):
+                st.session_state.is_admin = False
                 st.rerun()
+        else:
+            with st.form("login", border=False):
+                pw = st.text_input("비밀번호", type="password")
+                if st.form_submit_button("들어가기", width="stretch"):
+                    if wait := admin_locked():
+                        st.error(f"비밀번호를 여러 번 틀렸어요. {wait}초 뒤에 다시 해 보세요.")
+                    elif hmac.compare_digest(pw.encode(), password.encode()):
+                        get_attempts().pop("admin", None)
+                        st.session_state.is_admin = True
+                        st.rerun()
+                    else:
+                        admin_fail()
+                        st.error("비밀번호가 달라요.")
+    return st.session_state.get("is_admin", False)
 
 
-def pin_section(key, cls):
-    st.markdown("#### 🔑 PIN 잊어버린 학생")
-    who = st.selectbox("PIN 잊어버린 학생", sorted(cls["students"]), index=None,
-                       placeholder="학생 고르기", key=f"pin_target_{key}")
-    new_pin = st.text_input("새 PIN (숫자 4자리)", max_chars=4, key=f"pin_new_{key}",
-                            help="비워 두고 'PIN 지우기'를 누르면 학생이 '처음이에요'에서 새 PIN을 직접 정해요.")
-    b1, b2 = st.columns(2)
-    if b1.button("새 PIN으로 바꾸기", disabled=who is None):
-        if not PIN_RE.match(new_pin.strip()):
-            st.error("PIN은 숫자 4자리로 적어 주세요.")
-        elif run(set_pin, key, who, new_pin.strip()) is not None:
-            record_ok(("student", key, who))  # 잠긴 상태도 풀어 주기
-            st.session_state.flash = f"{who} 학생의 PIN을 바꿨어요. 학생에게 알려 주세요."
+NEW = "__new__"
+
+
+def pick_session(sessions):
+    """사이드바에서 발표회 고르기. NEW 면 새로 만들기"""
+    order = sorted(sessions, key=lambda c: sessions[c].get("created_at", ""), reverse=True)
+    options = order + [NEW]
+    if pending := st.session_state.pop("pending_select", None):
+        st.session_state.sel_session = pending
+    if st.session_state.get("sel_session") not in options:
+        url_code = (st.query_params.get("code") or "").upper()
+        st.session_state.sel_session = url_code if url_code in sessions else (order[0] if order else NEW)
+    st.sidebar.markdown("#### 📚 발표회")
+    code = st.sidebar.selectbox(
+        "발표회", options, key="sel_session", label_visibility="collapsed",
+        format_func=lambda c: "➕ 새 발표회 만들기" if c == NEW else sessions[c]["name"])
+    if code != NEW and st.query_params.get("code") != code:
+        st.query_params["code"] = code  # 선생님 메뉴에서 나가면 바로 이 발표회 학생 화면이 보이게
+    return code
+
+
+def create_form():
+    st.subheader("➕ 새 발표회 만들기")
+    st.caption("반마다 하나씩 만들어요. 만들면 입장 코드가 자동으로 생겨요.")
+    with st.form("create_session"):
+        name = st.text_input("발표회 이름", max_chars=40, placeholder="예: 26가을 AI파이썬랩 심화 토 11:00")
+        roster = st.text_area("학생 명단 (한 줄에 한 명)", height=180, placeholder="김피클\n이코딩\n박파이")
+        ok = st.form_submit_button("만들기", type="primary")
+    if ok:
+        name, names = clean(name), parse_names(roster)
+        if not name:
+            st.error("발표회 이름을 적어 주세요.")
+        elif not names:
+            st.error("학생 이름을 한 명 이상 넣어 주세요.")
+        elif code := run(create_session, name, names):
+            st.session_state.pending_select = code
+            st.session_state.flash = f"'{name}' 발표회를 만들었어요. 입장 코드는 {code} 예요."
             st.rerun()
-    if b2.button("PIN 지우기", disabled=who is None):
-        if run(clear_pin, key, who) is not None:
-            record_ok(("student", key, who))
-            st.session_state.flash = f"{who} 학생의 PIN을 지웠어요. '처음이에요'에서 새 PIN을 정하게 해 주세요."
-            st.rerun()
 
 
-def tab_stages(key, cls):
-    st.subheader("🎛️ 진행 단계")
-    st.caption("수업 흐름에 맞춰 켜고 꺼요. 보통 등록 → 투표 → 결과 공개 순서예요.")
-    c1, c2, c3 = st.columns(3)
-    for col, flag, text in ((c1, "registration_open", "프로젝트 등록 받기"),
-                            (c2, "voting_open", "투표 받기"),
-                            (c3, "revealed", "결과 공개")):
-        current = cls.get(flag, flag != "revealed")
-        new = col.toggle(text, value=current, key=f"flag_{key}_{flag}")
-        if new != current:
-            run(set_flag, key, flag, new)
-            st.rerun()
+@st.dialog("📺 입장 안내", width="large")
+def entry_dialog(code, name):
+    url = entry_url(code)
+    st.markdown(f"<div style='text-align:center'><div style='font-size:1.5rem;font-weight:600'>{html.escape(name)}</div>"
+                f"<div style='font-size:1.1rem;color:#6b7280;margin-top:8px'>입장 코드</div>"
+                f"<div style='font-size:6rem;font-weight:800;letter-spacing:0.3em;line-height:1.1'>{code}</div></div>",
+                unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([3, 2, 3])
+    c2.image(qr_png(url, scale=10), width="stretch")
+    st.markdown(f"<div style='text-align:center;color:#6b7280'>QR을 찍거나 {html.escape(app_url())} 에서 코드를 넣어요</div>",
+                unsafe_allow_html=True)
 
 
-def delete_box(title, help_text, options, fmt, action, args, done, wkey):
-    """여러 개 골라서 지우기: 고르기 → '지울게요' 확인 → 삭제"""
-    n = st.session_state.get("del_nonce", 0)  # 지운 뒤 고른 칸을 비우기 위한 번호
-    with st.container(border=True):
-        st.markdown(f"**{title}**")
-        st.caption(help_text)
-        if not options:
-            st.caption("지울 항목이 없어요.")
-            return
-        picked = st.multiselect(title, options, format_func=fmt, placeholder="지울 항목 고르기",
-                                label_visibility="collapsed", key=f"{wkey}_pick_{n}")
-        sure = st.checkbox("고른 항목을 지울게요", key=f"{wkey}_sure_{n}")
-        if st.button(f"선택한 {len(picked)}개 삭제" if picked else "삭제", key=f"{wkey}_btn_{n}",
-                     disabled=not (picked and sure)):
-            removed = run(action, *args, picked)
-            if removed is not None:
-                st.session_state.del_nonce = n + 1
-                st.session_state.flash = done(removed)
-                st.rerun()
-
-
-def class_label(classes, k):
-    c = classes[k]
-    return (f"{c['semester']} · {c['course']} · {c['timeslot']} "
-            f"(학생 {len(c['students'])} · 프로젝트 {len(c['projects'])} · 투표 {len(c['votes'])})")
-
-
-def tab_cleanup(key, cls, data):
-    st.subheader("🧹 정리")
-    st.caption("지우면 되돌릴 수 없어요. 필요하면 💾 백업 탭에서 먼저 내려받아 두세요.")
-
-    st.markdown(f"#### 이 반 ({cls['semester']} · {cls['course']} · {cls['timeslot']})")
-    c1, c2 = st.columns(2)
-    with c1:
-        delete_box("📁 프로젝트 삭제", "프로젝트만 지워요. 학생과 투표 기록은 남아요.",
-                   sorted(cls["projects"]), lambda n: label(cls, n), delete_projects, (key,),
-                   lambda r: f"프로젝트 {len(r)}개를 지웠어요.", f"dp_{key}")
-        delete_box("🗳️ 투표 삭제", "고른 학생의 투표만 지워요. 그 학생은 다시 투표할 수 있어요.",
-                   sorted(cls["votes"]), str, delete_votes, (key,),
-                   lambda r: f"{len(r)}명의 투표를 지웠어요.", f"dv_{key}")
-    with c2:
-        delete_box("👤 학생 삭제", "명단에서 지워요. 그 학생의 프로젝트와 투표도 함께 지워져요.",
-                   sorted(cls["students"]), str, delete_students, (key,),
-                   lambda r: f"학생 {len(r)}명을 프로젝트·투표와 함께 지웠어요.", f"ds_{key}")
-        with st.container(border=True):
-            st.markdown("**🔄 투표 초기화**")
-            st.caption("이 반의 투표를 모두 지우고 결과 공개도 꺼요.")
-            sure = st.checkbox("이 반의 투표를 모두 지울게요", key=f"sure_reset_{key}")
-            if st.button("투표 초기화", disabled=not (sure and cls["votes"]), key=f"reset_{key}"):
-                if run(reset_votes, key):
-                    st.session_state.flash = "투표를 초기화했어요."
-                    st.rerun()
-
-    st.divider()
-    classes = data["classes"]
-    order = sorted(classes, key=lambda k: (-semester_sort_key(classes[k]["semester"])[0],
-                                           -semester_sort_key(classes[k]["semester"])[1],
-                                           classes[k]["course"], classes[k]["timeslot"]))
-    st.markdown("#### 🏫 반 삭제 (모든 학기)")
-    rows = ["| 학기 | 수업 | 시간대 | 학생 | 프로젝트 | 투표 |", "|---|---|---|--:|--:|--:|"]
-    for k in order:
-        c = classes[k]
-        mark = " ◀ 지금 보는 반" if k == key else ""
-        rows.append(f"| {md(c['semester'])} | {md(c['course'])} | {md(c['timeslot'])}{mark} | "
-                    f"{len(c['students'])} | {len(c['projects'])} | {len(c['votes'])} |")
+@st.fragment(run_every="5s")
+def status_table(code):
+    """학생별 등록·투표 현황 (5초마다 저절로 새로고침)"""
+    try:
+        s = store.load()["sessions"].get(code)
+    except Exception:
+        return
+    if not s:
+        return
+    students = s["students"]
+    if not students:
+        st.info("명단이 비어 있어요. 관리 탭에서 학생 이름을 넣어 주세요.")
+        return
+    voted = {v for v, b in valid_ballots(s).items() if len(b) == len(CATEGORIES)}
+    rows = ["| 이름 | 프로젝트 | 투표 |", "|---|:--:|:--:|"]
+    for name in sorted(students):
+        rows.append(f"| {md(name)} | {'✅' if name in s['projects'] else '-'} | {'✅' if name in voted else '-'} |")
     st.markdown("\n".join(rows))
-    c1, c2 = st.columns(2)
-    with c1:
-        delete_box("반 골라서 삭제", "고른 반의 학생·프로젝트·투표가 모두 지워져요.",
-                   order, lambda k: class_label(classes, k), delete_classes, (),
-                   lambda r: f"반 {len(r)}개를 지웠어요.", "dc")
-    with c2:
+    st.caption(f"{len(students)}명 · 프로젝트 {len(s['projects'])}개 · 투표 완료 {len(voted)}명 · 5초마다 저절로 새로고침돼요.")
+
+
+def tab_progress(code, s):
+    stage = s.get("stage", "ready")
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        st.markdown("##### 진행 단계")
+        stage_steps(stage)
+        st.caption(f"지금: {STAGE_HELP[stage]}")
+        i = STAGES.index(stage)
+        if i == len(STAGES) - 1:
+            st.success("모든 단계가 끝났어요. 학생 화면에 결과가 보이고 있어요.")
+        b1, b2 = st.columns([3, 2])
+        if i < len(STAGES) - 1 and b1.button(f"▶ {NEXT_LABEL[stage]}", type="primary", width="stretch"):
+            if run(set_stage, code, STAGES[i + 1]):
+                st.session_state.flash = f"'{STAGE_NAMES[STAGES[i + 1]]}' 단계로 넘어갔어요."
+                st.rerun()
+        if i > 0 and b2.button(f"◀ 이전 단계로 ({STAGE_NAMES[STAGES[i - 1]]})", width="stretch"):
+            if run(set_stage, code, STAGES[i - 1]):
+                st.session_state.flash = f"'{STAGE_NAMES[STAGES[i - 1]]}' 단계로 되돌렸어요."
+                st.rerun()
+    with right:
         with st.container(border=True):
-            st.markdown("**학기 통째로 삭제**")
-            st.caption("그 학기의 모든 반과 학생·프로젝트·투표가 지워져요.")
-            n = st.session_state.get("del_nonce", 0)
-            sem = st.selectbox("학기", sorted_semesters(classes), index=None, placeholder="학기 고르기",
-                               label_visibility="collapsed", key=f"dsem_pick_{n}")
-            targets = [k for k in order if classes[k]["semester"] == sem]
-            sure = st.checkbox("이 학기를 통째로 지울게요", key=f"dsem_sure_{n}")
-            if st.button(f"{sem} 반 {len(targets)}개 삭제" if sem else "삭제", key=f"dsem_btn_{n}",
-                         disabled=not (sem and sure)):
-                removed = run(delete_classes, targets)
-                if removed is not None:
-                    st.session_state.del_nonce = n + 1
-                    st.session_state.flash = f"{sem} 학기의 반 {len(removed)}개를 지웠어요."
-                    st.rerun()
+            st.markdown("##### 학생 입장")
+            c1, c2 = st.columns([1, 1])
+            c1.caption("입장 코드")
+            c1.markdown(f"<div style='font-size:2.6rem;font-weight:800;letter-spacing:0.2em'>{code}</div>",
+                        unsafe_allow_html=True)
+            c2.image(qr_png(entry_url(code)), width=130)
+            if st.button("📺 크게 띄우기", width="stretch"):
+                entry_dialog(code, s["name"])
+            st.caption("학생 주소 (복사해서 보내도 돼요)")
+            st.code(entry_url(code), language=None)
 
     st.divider()
-    wipe_section(data)
+    st.markdown("##### 학생 현황")
+    status_table(code)
+
+    st.divider()
+    st.markdown(f"##### 프로젝트 ({len(s['projects'])}개)")
+    st.caption("발표할 때 '앱 열어 보기'로 띄우세요. 선생님은 언제든 고치거나 지울 수 있어요.")
+    if s["projects"]:
+        project_cards(code, s, sorted(s["projects"]), teacher=True)
+    else:
+        st.caption("아직 등록된 프로젝트가 없어요.")
 
 
-def backup_button(data, key="backup"):
-    st.download_button("전체 데이터 내려받기 (JSON)",
-                       json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-                       file_name=f"vote_data_{datetime.now(KST):%Y%m%d_%H%M}.json",
-                       mime="application/json", key=key)
+def tab_results(code, s):
+    if s.get("stage") != "result":
+        st.warning("👀 미리보기예요. 학생에게는 '결과 공개' 단계가 되어야 보여요.")
+    private = st.toggle("🔐 선생님만 볼 정보 보이기 (표 수 · 모든 학생의 한마디)", value=False, key=f"private_{code}",
+                        help="교실 화면에 띄울 때는 꺼 두세요. 꺼져 있으면 학생 화면과 똑같이 순위만 보여요.")
+    results(code, s, teacher=True, private=private)
 
 
-def wipe_section(data):
-    """앱 전체 데이터 삭제: 확인 문구 + 선생님 비밀번호를 모두 넣어야 실행"""
-    st.markdown("#### ⚠️ 앱 전체 데이터 삭제")
-    classes = data["classes"]
-    n_students = sum(len(c["students"]) for c in classes.values())
-    n_projects = sum(len(c["projects"]) for c in classes.values())
-    n_votes = sum(len(c["votes"]) for c in classes.values())
-    with st.container(border=True):
-        st.error(f"모든 학기의 반 {len(classes)}개, 학생 {n_students}명, 프로젝트 {n_projects}개, 투표 {n_votes}건을 "
-                 "한꺼번에 지워요. 되돌릴 수 없으니 먼저 백업을 내려받아 두세요.")
-        backup_button(data, key="backup_before_wipe")
-        with st.form("wipe_all", clear_on_submit=True):
-            phrase = st.text_input("확인 문구: **전체 삭제** 라고 입력해 주세요")
-            pw = st.text_input("선생님 비밀번호 다시 입력", type="password")
-            submitted = st.form_submit_button("앱 전체 데이터 삭제", type="primary")
-        if submitted:
-            password = admin_password()
-            if phrase.strip() != "전체 삭제":
-                st.error("확인 문구가 달라요. '전체 삭제'라고 정확히 입력해 주세요.")
-            elif not password or not hmac.compare_digest(pw.encode(), password.encode()):
-                st.error("비밀번호가 달라요.")
-            elif run(wipe_all):
-                get_attempts().clear()  # PIN 잠금 기록도 비우기
-                for k in ("sel_semester", "sel_course", "sel_time", "pending_select"):
-                    st.session_state.pop(k, None)
-                st.session_state.flash = "앱의 모든 데이터를 지웠어요."
+def tab_manage(code, s, data):
+    with st.expander("👥 학생 명단", expanded=True):
+        names = sorted(s["students"])
+        st.write(", ".join(names) if names else "아직 명단이 없어요.")
+        with st.form(f"roster_{code}", clear_on_submit=True):
+            text = st.text_area("이름 추가 (한 줄에 한 명)", height=100, placeholder="김피클\n이코딩")
+            if st.form_submit_button("명단에 추가"):
+                new = parse_names(text)
+                if not new:
+                    st.error("추가할 이름을 적어 주세요.")
+                elif (added := run(add_students, code, new)) is not None:
+                    skipped = len(new) - len(added)
+                    st.session_state.flash = f"{len(added)}명을 넣었어요." + (f" (이미 있는 이름 {skipped}명은 건너뜀)" if skipped else "")
+                    st.rerun()
+        if names:
+            n = st.session_state.get("del_nonce", 0)
+            picked = st.multiselect("학생 삭제 (그 학생의 프로젝트와 투표도 함께 지워져요)", names,
+                                    placeholder="지울 학생 고르기", key=f"del_pick_{code}_{n}")
+            sure = st.checkbox("고른 학생을 지울게요", key=f"del_sure_{code}_{n}")
+            if st.button(f"학생 {len(picked)}명 삭제" if picked else "학생 삭제", disabled=not (picked and sure)):
+                if (removed := run(delete_students, code, picked)) is not None:
+                    st.session_state.del_nonce = n + 1
+                    st.session_state.flash = f"학생 {len(removed)}명을 지웠어요."
+                    st.rerun()
+
+    with st.expander("💾 백업"):
+        st.caption("모든 발표회의 명단·프로젝트·투표를 JSON 파일 하나로 내려받아요. 학생 이름이 들어 있으니 선생님 컴퓨터에만 보관하세요.")
+        st.download_button("전체 데이터 내려받기 (JSON)",
+                           json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                           file_name=f"vote_data_{datetime.now(KST):%Y%m%d_%H%M}.json", mime="application/json")
+
+    with st.expander("🗑️ 발표회 삭제"):
+        st.caption(f"'{s['name']}' 발표회의 명단·프로젝트·투표가 모두 지워져요. 되돌릴 수 없어요.")
+        sure = st.checkbox("이 발표회를 지울게요", key=f"sure_session_{code}")
+        if st.button("발표회 삭제", disabled=not sure, type="primary"):
+            if run(delete_session, code):
+                st.session_state.pop("sel_session", None)
+                st.query_params.pop("code", None)
+                st.session_state.flash = f"'{s['name']}' 발표회를 지웠어요."
                 st.rerun()
 
+    if d := expire_date(s):
+        st.caption(f"🗓️ 발표회는 만든 지 {KEEP_DAYS}일이 지나면 자동으로 지워져요. 이 발표회는 {d:%Y-%m-%d} 이후에 지워져요.")
 
-def tab_backup(data):
-    st.subheader("💾 백업")
-    backup_button(data)
-    st.caption(f"저장 위치: {store.name}")
+
+def teacher_view(code, s, data):
+    st.markdown(f"#### {s['name']}")
+    st.caption(f"입장 코드 {code} · 만든 날 {s.get('created_at', '')[:10]}")
+    tabs = st.tabs(["▶️ 진행", "🏆 결과", "⚙️ 관리"], key="teacher_tabs")
+    with tabs[0]:
+        tab_progress(code, s)
+    with tabs[1]:
+        tab_results(code, s)
+    with tabs[2]:
+        tab_manage(code, s, data)
 
 
 # ── 메인 ─────────────────────────────────────────────
@@ -1060,7 +945,7 @@ def main():
     is_admin = teacher_login()
 
     try:
-        data = normalize(store.load())
+        data = load_data()
     except Exception as e:
         st.error(f"데이터를 불러오지 못했어요. 새로고침해 주세요. ({e})")
         st.stop()
@@ -1070,67 +955,22 @@ def main():
     if st.session_state.pop("balloons", False):
         st.balloons()
 
-    classes = data["classes"]
-    if is_admin:  # 선생님: 사이드바에서 모든 학기의 반을 고름
-        key, me = pick_class(classes), None
-        if key is None or key not in classes:
-            st.info("아직 만들어진 반이 없어요.")
-            class_creator()
-            return
-    else:  # 학생: 먼저 로그인, 로그인한 반으로 고정
-        login = current_login(classes)
-        if not login:
-            login_panel(classes)
-            return
-        key, me = login
-
-    cls = classes[key]
-    st.markdown(f"#### {cls['semester']} · {cls['course']} · {cls['timeslot']}")
-    steps = [
-        ("등록 받는 중" if cls.get("registration_open", True) else "등록 마감"),
-        ("투표 받는 중" if cls.get("voting_open", True) else "투표 마감"),
-        ("결과 공개" if cls.get("revealed") else "결과 비공개"),
-    ]
-    st.caption(" · ".join(steps))
+    sessions = data["sessions"]
     if is_admin:
-        st.caption("🔐 선생님 모드: 모든 프로젝트를 고칠 수 있고, 결과를 미리 볼 수 있어요. 학생 화면을 보려면 선생님 메뉴에서 나가기를 눌러 주세요.")
-        names = ["🔍 프로젝트 보기", "🏆 결과 보기", "👥 학생 명단", "🔗 학생 주소",
-                 "🎛️ 진행 단계", "🧹 정리", "➕ 새 반", "💾 백업"]
-        tabs = st.tabs(names, key="teacher_tabs")
-        with tabs[0]:
-            tab_projects(key, cls, me, is_admin)
-        with tabs[1]:
-            tab_results(key, cls, me, is_admin)
-        with tabs[2]:
-            tab_roster(key, cls)
-            if cls["students"]:
-                st.divider()
-                pin_section(key, cls)
-        with tabs[3]:
-            tab_link(cls)
-        with tabs[4]:
-            tab_stages(key, cls)
-        with tabs[5]:
-            tab_cleanup(key, cls, data)
-        with tabs[6]:
-            class_creator({"semester": cls["semester"], "course": cls["course"]})
-        with tabs[7]:
-            tab_backup(data)
+        purge_old(sessions)
+        code = pick_session(sessions)
+        if code == NEW:
+            create_form()
+        else:
+            teacher_view(code, sessions[code], data)
     else:
-        student_bar(cls, me)
-        names = ["📝 프로젝트 등록", "🔍 프로젝트 보기", "🗳️ 투표하기", "🏆 결과 보기"]
-        tabs = st.tabs(names, key="main_tabs")  # key: 제출 후 새로고침돼도 보던 탭 유지
-        with tabs[0]:
-            tab_register(key, cls, me)
-        with tabs[1]:
-            tab_projects(key, cls, me, is_admin)
-        with tabs[2]:
-            tab_vote(key, cls, me)
-        with tabs[3]:
-            tab_results(key, cls, me, is_admin)
+        login = current_login(sessions)
+        if login:
+            student_view(login[0], sessions[login[0]], login[1])
+        else:
+            entry_page(sessions)
 
-    if is_admin:
-        st.sidebar.divider()
+    st.sidebar.divider()
     if st.sidebar.button("🔄 새로고침", width="stretch"):
         st.rerun()
 
